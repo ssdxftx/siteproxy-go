@@ -37,16 +37,21 @@ user browser +--------------->+ siteproxy-go   +-------> wikipedia
 
 ## 快速开始
 
-### 1. 下载 / 编译
+### 1. 从本仓库构建
 
 ```bash
-# 直接编译（需要 Go 1.23+）
-git clone <this-repo> && cd siteproxy-go
-make build          # 生成 ./siteproxy-go
+git clone https://github.com/ssdxftx/siteproxy-go.git
+cd siteproxy-go
 
-# 或交叉编译所有平台
-make cross          # 输出到 ./dist/
+# 需要 Go 1.26+
+make test
+make build
+./siteproxy-go -version
 ```
+
+`make build` 生成当前平台的 `./siteproxy-go`；`make cross` 生成 `./dist/` 下的
+linux/amd64、linux/arm64、darwin/amd64、darwin/arm64、windows/amd64、freebsd/amd64
+静态二进制。运行时不依赖 Go 工具链或 Node.js，只需要二进制和 `config.json`。
 
 ### 2. 修改配置
 
@@ -72,55 +77,258 @@ make cross          # 输出到 ./dist/
 环境变量（优先级高于 config.json，便于容器部署）：
 
 ```bash
-SITEPROXY_PROXY_URL=https://your-proxy.domain.name
-SITEPROXY_TOKEN_PREFIX=/user-your-password/
-SITEPROXY_LOCAL_LISTEN_PORT=5006
-SITEPROXY_BLOCKED_SITES=a.com,b.com
-SITEPROXY_INSECURE_SKIP_VERIFY=0   # 仅调试自签名上游时设为 1
+# 环境变量优先级高于 config.json，适合 systemd / Docker
+export SITEPROXY_PROXY_URL=https://proxy.example.com
+export SITEPROXY_TOKEN_PREFIX=/user-your-password/
+export SITEPROXY_LOCAL_LISTEN_PORT=5006
+export SITEPROXY_BLOCKED_SITES=a.com,b.com
+
+# 仅调试自签名上游证书时设为 1，生产环境保持 0
+export SITEPROXY_INSECURE_SKIP_VERIFY=0
 ```
 
-### 3. 部署（nginx 反代 + TLS，与原版一致）
+### 3. 本地运行
 
-```nginx
+```bash
+./siteproxy-go -config ./config.json
+```
+
+默认配置监听 `5006`，可访问：
+
+```
+http://127.0.0.1:5006/user22334455/https/example.com/
+```
+
+按 `Ctrl+C` 停止。本地 HTTP 仅用于测试，公网部署请使用下面的 nginx + TLS。
+
+## 服务器部署（systemd + nginx）
+
+生产环境推荐拓扑：
+
+```
+浏览器 --HTTPS--> nginx :443 --HTTP--> 127.0.0.1:5006 siteproxy-go
+```
+
+Go 进程以 HTTP 监听 `5006`，TLS 由 nginx 终止，nginx 通过回环地址访问它；公网只开放 80/443。
+
+### 1. 安装文件
+
+先在仓库目录把 `config.json` 的 `proxy_url`、`token_prefix` 改成生产值。首次部署执行：
+
+```bash
+sudo groupadd --system siteproxy
+sudo useradd --system --gid siteproxy --no-create-home --shell /usr/sbin/nologin siteproxy
+sudo install -d -m 0755 /opt/siteproxy-go /etc/siteproxy
+sudo install -m 0755 -o root -g root siteproxy-go /opt/siteproxy-go/siteproxy-go
+sudo install -m 0640 -o root -g siteproxy config.json /etc/siteproxy/config.json
+```
+
+`/etc/siteproxy/config.json` 含访问密码，权限保持 `0640`；不要把真实密码提交到仓库。
+
+### 2. 创建 systemd 服务
+
+```bash
+sudo tee /etc/systemd/system/siteproxy-go.service >/dev/null <<'EOF'
+[Unit]
+Description=siteproxy-go reverse proxy
+Documentation=https://github.com/ssdxftx/siteproxy-go
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=siteproxy
+Group=siteproxy
+WorkingDirectory=/opt/siteproxy-go
+ExecStart=/opt/siteproxy-go/siteproxy-go -config /etc/siteproxy/config.json
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=65536
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+```
+
+### 3. 配置 nginx
+
+先定义 WebSocket 升级映射（如果已有同名 `map` 则跳过）：
+
+```bash
+sudo tee /etc/nginx/conf.d/siteproxy-upgrade.conf >/dev/null <<'EOF'
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+EOF
+```
+
+公共反代参数放到 snippet：
+
+```bash
+sudo tee /etc/nginx/snippets/siteproxy-proxy.conf >/dev/null <<'EOF'
+proxy_pass http://127.0.0.1:5006;
+proxy_http_version 1.1;
+proxy_set_header Host $host;
+proxy_set_header X-Real-IP $remote_addr;
+proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+proxy_set_header X-Forwarded-Proto $scheme;
+proxy_set_header Upgrade $http_upgrade;
+proxy_set_header Connection $connection_upgrade;
+proxy_buffering off;
+proxy_request_buffering off;
+proxy_read_timeout 3600s;
+proxy_send_timeout 3600s;
+client_max_body_size 0;
+EOF
+```
+
+站点配置（把 `proxy.example.com` 换成你的域名）：
+
+```bash
+sudo tee /etc/nginx/sites-available/siteproxy-go >/dev/null <<'EOF'
 server {
-    server_name your-proxy.domain.name;
+    listen 80;
+    listen [::]:80;
+    server_name proxy.example.com;
+
     location / {
-        proxy_pass http://localhost:5006;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;      # WebSocket 透传
-        proxy_set_header Connection "upgrade";
-        proxy_set_header Host $host;
-        proxy_buffering off;                          # SSE 流式必需
-        proxy_read_timeout 3600s;
+        include snippets/siteproxy-proxy.conf;
     }
+}
+EOF
+
+sudo ln -s /etc/nginx/sites-available/siteproxy-go /etc/nginx/sites-enabled/siteproxy-go
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+`proxy_buffering off` 是 SSE 流式响应所需；`proxy_request_buffering off` 避免大上传落盘；
+`client_max_body_size 0` 允许代理大文件上传，可按需收紧。
+
+### 4. 申请 TLS 证书
+
+```bash
+sudo apt install -y certbot python3-certbot-nginx
+sudo certbot --nginx -d proxy.example.com
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+其他发行版使用对应的 certbot 安装方式。证书续期由 certbot 的 timer 自动完成。
+
+### 5. 启动与验证
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now siteproxy-go
+sudo systemctl status siteproxy-go --no-pager
+```
+
+```bash
+curl -sS -o /dev/null -w '%{http_code}\n' https://proxy.example.com/
+curl -sS -o /dev/null -w '%{http_code}\n' https://proxy.example.com/user-your-password/https/example.com/
+```
+
+两个请求都应返回 `200`。异常时查看日志：
+
+```bash
+sudo journalctl -u siteproxy-go -n 100 --no-pager
+```
+
+### 6. 防火墙
+
+只对公网开放 80/443，禁止直接访问 5006：
+
+```bash
+sudo ufw allow 'Nginx Full'
+sudo ufw deny 5006/tcp
+```
+
+如果使用云厂商安全组，同样只放行 80/443。Go 进程监听 `:5006`（所有网卡），必须用防火墙
+阻止公网直连；nginx 通过 `127.0.0.1:5006` 访问，不要用 `http://IP:5006` 对外提供服务。
+
+### 7. 更新
+
+```bash
+cd siteproxy-go
+git pull --ff-only
+make test
+make build
+sudo install -m 0755 -o root -g root siteproxy-go /opt/siteproxy-go/siteproxy-go
+sudo systemctl restart siteproxy-go
+```
+
+升级只替换二进制，不会覆盖 `/etc/siteproxy/config.json`。首页、客户端脚本和
+Service Worker 都通过 `go:embed` 编进二进制，重启后自动生效。
+
+## Docker 部署
+
+```bash
+git clone https://github.com/ssdxftx/siteproxy-go.git
+cd siteproxy-go
+
+# 修改 config.json 中的 proxy_url / token_prefix
+docker compose build
+docker compose up -d
+docker compose logs --tail=100
+```
+
+`docker-compose.yml` 默认把端口映射到所有网卡。生产环境建议改成只绑定回环地址，
+再由宿主机 nginx 反代：
+
+```yaml
+ports:
+  - "127.0.0.1:5006:5006"
+```
+
+修改后重新执行 `docker compose up -d`。配置通过 volume 挂载到容器内
+`/etc/siteproxy/config.json`，也可以取消 `docker-compose.yml` 中 `SITEPROXY_*`
+环境变量的注释来覆盖配置。
+
+更新：
+
+```bash
+git pull --ff-only
+docker compose build
+docker compose up -d
+```
+
+## 子路径部署
+
+`proxy_url` 支持带路径，例如把服务挂在 `https://proxy.example.com/siteproxy`：
+
+```json
+{
+  "proxy_url": "https://proxy.example.com/siteproxy",
+  "token_prefix": "/user-your-password/"
 }
 ```
 
-证书用 certbot 申请：`sudo certbot --nginx -d your-proxy.domain.name`
+nginx 使用相同前缀转发，`proxy_pass` 后面不要加 URI 或结尾斜杠：
 
-### 4. 启动
+```nginx
+location = /siteproxy {
+    return 301 /siteproxy/;
+}
 
-```bash
-./siteproxy-go                          # 读取同目录 config.json
-./siteproxy-go -config /etc/siteproxy/config.json
-./siteproxy-go -version
+location /siteproxy/ {
+    include snippets/siteproxy-proxy.conf;
+}
 ```
 
-### 5. 访问
-
-浏览器打开：
+访问地址为：
 
 ```
-https://your-proxy.domain.name/user-your-password/https/www.google.com/
+https://proxy.example.com/siteproxy/user-your-password/https/example.com/
 ```
 
-或先访问首页 `https://your-proxy.domain.name/`，在地址栏输入目标网站回车。
-
-## Docker 部署（可选）
-
-```bash
-docker compose up -d    # 端口 5006，配置挂载 ./config.json
-```
+`proxy_url` 的路径必须与 nginx 的 location 前缀一致；cookie Path、客户端运行时和
+Service Worker 会自动带上该前缀。
 
 ## 工作原理
 
