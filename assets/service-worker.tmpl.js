@@ -29,8 +29,15 @@
 const CONFIG = __SITEPROXY_CONFIG_JSON__;
 const TOKEN_PREFIX = CONFIG.token_prefix;
 const PROXY_ORIGIN = self.location.origin;
-const PROXY_URL_PREFIX = PROXY_ORIGIN + TOKEN_PREFIX;
-const PROXY_HOST = (CONFIG.proxy_url || '').substring((CONFIG.proxy_url || '').indexOf('//') + 2);
+const PROXY_URL_PREFIX = (CONFIG.proxy_url || PROXY_ORIGIN).replace(/\/+$/, '') + TOKEN_PREFIX;
+const PROXY_BASE_PATH = (() => {
+  try { return new URL(CONFIG.proxy_url || PROXY_ORIGIN).pathname.replace(/\/+$/, ''); }
+  catch (e) { return ''; }
+})();
+const PROXY_HOST = (() => {
+  try { return new URL(CONFIG.proxy_url || PROXY_ORIGIN).host; }
+  catch (e) { return ''; }
+})();
 
 // Current proxied site context, updated by pages via postMessage.
 let curLocation = {
@@ -57,6 +64,20 @@ self.addEventListener('message', (event) => {
   }
 });
 
+// Removes the configured proxy base path and token prefix from a pathname.
+// Returns null when the path is not inside the proxy scope.
+function pathInScope(pathname) {
+  let p = pathname;
+  if (PROXY_BASE_PATH && p.startsWith(PROXY_BASE_PATH)) p = p.substring(PROXY_BASE_PATH.length);
+  if (TOKEN_PREFIX === '/') return true;
+  return p.startsWith(TOKEN_PREFIX);
+}
+
+function isSelfScriptPath(pathname) {
+  return pathname.endsWith('/siteproxy-response-injected.js') ||
+         pathname.endsWith('/siteproxy_service_worker.js');
+}
+
 // Extracts {protocol, host} from a proxied URL (referer / client URL).
 function siteFromProxiedURL(u) {
   if (!u || !u.startsWith(PROXY_URL_PREFIX)) return null;
@@ -82,13 +103,6 @@ function unrewriteText(text) {
   text = text.replace(/___URL/g, 'URL');
   return text;
 }
-
-// Paths that must never be intercepted.
-const SELF_PATHS = new Set([
-  '/siteproxy_service_worker.js',
-  '/siteproxy-response-injected.js',
-  '/favicon.ico',
-]);
 
 self.addEventListener('fetch', (event) => {
   event.respondWith(handleFetch(event));
@@ -130,24 +144,30 @@ async function handleFetch(event) {
   }
 
   const headers = new Headers(req.headers);
-  headers.set('siteproxy-newreferer', siteProto + '://' + siteHost);
   headers.set('siteproxy-sw', '1');
 
+  // The referer must stay the current page's real origin, even when the
+  // request itself targets a cross-origin host.
+  const siteOrigin = siteProto + '://' + siteHost;
   let fetchURL = req.url;
-  const isSelfScripts = (CONFIG.proxy_url || '').endsWith(url.host) &&
-    (url.pathname === '/siteproxy-response-injected.js' ||
-     url.pathname === '/siteproxy_service_worker.js');
+  const isSelfScripts = url.host === PROXY_HOST && isSelfScriptPath(url.pathname);
 
-  if (siteProto !== undefined && !isSelfScripts && !url.pathname.startsWith(TOKEN_PREFIX)) {
-    // Out-of-scope request: repair it into the proxy scope.
-    if (siteHost !== url.host && !(CONFIG.proxy_url || '').endsWith(url.host)) {
+  if (siteProto !== undefined && !isSelfScripts &&
+      (url.host !== PROXY_HOST || !pathInScope(url.pathname))) {
+    // Out-of-scope request (or any cross-origin request): repair it into
+    // the proxy scope.
+    if (siteHost !== url.host && url.host !== PROXY_HOST) {
       siteHost = url.host; // cross-origin request: use its own host
     }
-    if (!(CONFIG.proxy_url || '').endsWith(siteHost)) {
+    if (siteHost !== PROXY_HOST) {
       const search = unrewriteText(url.search);
       fetchURL = PROXY_URL_PREFIX + siteProto + '/' + siteHost + url.pathname + search;
     }
   }
+
+  // Only send a real referer when the site context is known; otherwise an
+  // empty host would produce an invalid "https://" Referer upstream.
+  if (siteHost) headers.set('siteproxy-newreferer', siteOrigin);
 
   const init = {
     method: req.method,

@@ -65,7 +65,7 @@ make cross          # 输出到 ./dist/
 | 字段 | 说明 |
 |------|------|
 | `proxy_url` | 对外访问的完整地址（nginx 反代之后的公网 URL），用于生成代理链接、判断 HTTPS |
-| `token_prefix` | 访问密码，**首尾斜杠必须保留**；设为 `"/"` 表示免密码 |
+| `token_prefix` | 访问密码，**首尾斜杠必须保留**；显式设为 `"/"` 表示免密码，空字符串回退到原版默认密码 `/user22334455/` |
 | `local_listen_port` | 监听端口（默认 5006，与原版/nginx 配置兼容） |
 | `blocked_sites` | 禁止代理的站点列表（自动附带 exchangebank.com / netsuite.com 等） |
 

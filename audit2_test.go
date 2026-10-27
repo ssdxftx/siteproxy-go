@@ -20,8 +20,10 @@ func TestInlineScriptLocationRewrites(t *testing.T) {
 window.location.href = "/goto";
 window.location = "/land";
 if (window.location == a) { }
+location.href = "/bare";
 var u = "https://api.example.com/endpoint";
 var my_location = 1;
+var r = /location/;
 </script></head></html>`
 	got := rewriteHTML(html, publicPrefix, base, "p.example",
 		renderInlineBootstrap(newTestConfig(0), "http", "mock.host")+injectedScriptTag)
@@ -32,19 +34,26 @@ var my_location = 1;
 	if !strings.Contains(got, "window.___location = \"/land\";") {
 		t.Errorf("location assignment not rewritten:\n%s", got)
 	}
-	// Comparisons and string literals untouched (upstream behaviour).
-	if !strings.Contains(got, "if (window.location == a) { }") {
-		t.Errorf("comparison must stay untouched:\n%s", got)
+	// Identifier rewrites also cover comparisons and bare location, while
+	// strings/regex literals and longer identifiers stay untouched.
+	if !strings.Contains(got, "if (window.___location == a) { }") {
+		t.Errorf("comparison identifier not rewritten:\n%s", got)
+	}
+	if !strings.Contains(got, "___location.href = \"/bare\";") {
+		t.Errorf("bare location not rewritten:\n%s", got)
 	}
 	if !strings.Contains(got, `var u = "https://api.example.com/endpoint";`) {
 		t.Errorf("string literal must stay untouched:\n%s", got)
 	}
 	if strings.Contains(got, "my___location") {
-		t.Errorf("identifier must not be rewritten (node mode):\n%s", got)
+		t.Errorf("longer identifier must not be rewritten:\n%s", got)
+	}
+	if !strings.Contains(got, "var r = /location/;") {
+		t.Errorf("regex literal corrupted:\n%s", got)
 	}
 }
 
-// --- rewrite.go: external JS file shape (upstream `_0x33f3fc`) ---------------
+// --- rewrite.go: external JS identifier rewrites -----------------------------
 
 func TestJSFileLocationRewrites(t *testing.T) {
 	in := "window.location.href = \"/next\";\n" +
@@ -52,20 +61,19 @@ func TestJSFileLocationRewrites(t *testing.T) {
 		"if (window.location == a) { }\n" +
 		"location.href = \"/bare\";\n"
 	got := rewriteJSFile(in)
-	// Upstream consumes the whitespace before '=' for external files.
-	if !strings.Contains(got, "window.___location.href= \"/next\";") {
-		t.Errorf("href file-shape rewrite mismatch:\n%s", got)
+	// The identifier scanner preserves the original spacing and also rewrites
+	// bare location references.
+	if !strings.Contains(got, "window.___location.href = \"/next\";") {
+		t.Errorf("href rewrite mismatch:\n%s", got)
 	}
-	if !strings.Contains(got, "window.___location= c;") {
-		t.Errorf("plain file-shape rewrite mismatch:\n%s", got)
+	if !strings.Contains(got, "window.___location = c;") {
+		t.Errorf("plain location rewrite mismatch:\n%s", got)
 	}
-	// Upstream's `\s*=` regex also catches `location == x` comparisons in
-	// external files (faithful upstream quirk).
-	if !strings.Contains(got, "if (window.___location== a) { }") {
-		t.Errorf("file-shape comparison handling (upstream quirk) mismatch:\n%s", got)
+	if !strings.Contains(got, "if (window.___location == a) { }") {
+		t.Errorf("comparison rewrite mismatch:\n%s", got)
 	}
-	if !strings.Contains(got, "location.href = \"/bare\";") {
-		t.Errorf("bare location must stay untouched in node mode:\n%s", got)
+	if !strings.Contains(got, "___location.href = \"/bare\";") {
+		t.Errorf("bare location not rewritten:\n%s", got)
 	}
 }
 
@@ -110,8 +118,8 @@ func TestCookieTooLarge431(t *testing.T) {
 			expired++
 		}
 	}
-	if expired != 4 { // 2 cookies × (Path=/ + site path)
-		t.Errorf("want 4 expired-cookie headers, got %d: %v", expired, sc)
+	if expired != 12 { // 2 cookies × 6 Domain/Path variants
+		t.Errorf("want 12 expired-cookie headers, got %d: %v", expired, sc)
 	}
 }
 

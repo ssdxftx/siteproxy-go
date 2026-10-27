@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/tls"
 	"net"
+	"strings"
 	"time"
 )
 
@@ -13,7 +14,14 @@ func tlsDialWithHost(dialer *net.Dialer, network, addr, hostname string) (net.Co
 	if err != nil {
 		return nil, err
 	}
-	cfg := &tls.Config{ServerName: hostname, InsecureSkipVerify: insecureSkipVerify()}
+	serverName := hostname
+	if h, _, err := net.SplitHostPort(hostname); err == nil {
+		serverName = h
+	}
+	if strings.HasPrefix(serverName, "[") && strings.HasSuffix(serverName, "]") {
+		serverName = serverName[1 : len(serverName)-1]
+	}
+	cfg := &tls.Config{ServerName: serverName, InsecureSkipVerify: insecureSkipVerify()}
 	conn := tls.Client(raw, cfg)
 	if err := conn.SetDeadline(time.Now().Add(15 * time.Second)); err != nil {
 		_ = raw.Close()

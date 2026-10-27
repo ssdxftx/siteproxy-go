@@ -31,24 +31,51 @@
 
   var token_prefix = CONFIG.token_prefix;
   var config_proxy_url = CONFIG.proxy_url;
-  var proxy_url_prefix = location.origin + token_prefix;
+  // The proxy may be deployed under a path (https://host/sub); use the
+  // configured public URL, not just the origin, when building proxied URLs.
+  var proxy_url_prefix = (config_proxy_url || location.origin).replace(/\/+$/, '') + token_prefix;
+  var proxyBasePath = '';
+  try {
+    proxyBasePath = new URL(config_proxy_url || location.origin).pathname.replace(/\/+$/, '');
+  } catch (e) { /* ignore */ }
 
-  // Proxy host without scheme/port, used as the Domain for JS-set cookies.
-  var proxyHostNoScheme = config_proxy_url.substring(config_proxy_url.indexOf('//') + 2);
-  if (proxyHostNoScheme.indexOf('/') !== -1) {
-    proxyHostNoScheme = proxyHostNoScheme.substring(0, proxyHostNoScheme.indexOf('/'));
+  // Proxy host without scheme, used for same-origin/protocol-relative checks.
+  var proxyHostFull = config_proxy_url.substring(config_proxy_url.indexOf('//') + 2);
+  if (proxyHostFull.indexOf('/') !== -1) {
+    proxyHostFull = proxyHostFull.substring(0, proxyHostFull.indexOf('/'));
+  }
+  // Cookie Domain values must not contain a port (upstream strips it too).
+  var proxyHostNoScheme = proxyHostFull;
+  if (proxyHostNoScheme.charAt(0) === '[') {
+    var bracket = proxyHostNoScheme.indexOf(']');
+    if (bracket !== -1) proxyHostNoScheme = proxyHostNoScheme.substring(0, bracket + 1);
+  } else if (proxyHostNoScheme.indexOf(':') !== -1) {
+    proxyHostNoScheme = proxyHostNoScheme.substring(0, proxyHostNoScheme.indexOf(':'));
   }
 
   // ------------------------------------------------------------------
   // 1. Current site context — derived from the proxied path.
   // ------------------------------------------------------------------
-  function parseCurrentLocation() {
-    var path = location.pathname;
-    if (token_prefix !== '/' && path.indexOf(token_prefix) === 0) {
-      path = path.substring(token_prefix.length);
+  // stripProxyPrefixPath removes the configured proxy base path and the
+  // token prefix from a pathname. It returns null when the path is not in
+  // proxy scope, so real root-relative paths are never mistaken for one.
+  function stripProxyPrefixPath(path) {
+    if (proxyBasePath && path.indexOf(proxyBasePath) === 0) {
+      path = path.substring(proxyBasePath.length);
     }
-    var m = path.match(/^(https?)\/([^/]+)(?:\/|$)/);
-    if (m) return { protocol: m[1], host: m[2] };
+    if (token_prefix === '/') {
+      return path.charAt(0) === '/' ? path.substring(1) : path;
+    }
+    if (path.indexOf(token_prefix) !== 0) return null;
+    return path.substring(token_prefix.length);
+  }
+
+  function parseCurrentLocation() {
+    var path = stripProxyPrefixPath(location.pathname);
+    if (path !== null) {
+      var m = path.match(/^(https?)\/([^/]+)(?:\/|$)/);
+      if (m) return { protocol: m[1], host: m[2] };
+    }
     return { protocol: CONFIG.proxy_real_protocol || 'https',
              host: CONFIG.proxy_real_host || '' };
   }
@@ -78,9 +105,27 @@
     return /^(javascript|data|blob|mailto|tel|about|ws|wss|ftp|file|sms|view-source|webcal|content|ssh|vbscript|chrome):/i.test(url);
   }
 
+  // Exact proxy-host check (a prefix check would wrongly match hosts such
+  // as "proxy.example.evil").
+  function isProxyHostURL(url) {
+    try { return new URL(url, location.href).host.toLowerCase() === proxyHostFull.toLowerCase(); }
+    catch (e) { return false; }
+  }
+
+  // Map a URL on the proxy origin but outside the token scope into the
+  // current site's scope (upstream urlMeta behaviour).
+  function mapProxyOriginURL(url) {
+    if (!proxy_real_host) return url;
+    try {
+      var u = new URL(url, location.href);
+      return proxy_url_prefix + proxy_real_protocol + '/' + proxy_real_host +
+             u.pathname + u.search + u.hash;
+    } catch (e) { return url; }
+  }
+
   function proxyRewrite(url) {
     if (typeof url !== 'string') return url;
-    if (url.startsWith(proxy_url_prefix)) return url;
+    if (url.toLowerCase().startsWith(proxy_url_prefix.toLowerCase())) return url;
     if (token_prefix !== '/' && url.startsWith(token_prefix)) return url;
 
     // Generic scheme check: only http(s) URLs are proxied.
@@ -88,17 +133,22 @@
     if (sm && !/^https?$/i.test(sm[1])) return url;
 
     if (url.startsWith('http://') || url.startsWith('https://')) {
-      if (config_proxy_url && url.startsWith(config_proxy_url)) return url; // no self-wrap
+      if (isProxyHostURL(url)) {
+        if (url.startsWith(proxy_url_prefix)) return url;
+        return mapProxyOriginURL(url);
+      }
       var protocol = url.split('://')[0];
       var rest = url.substring(protocol.length + 3);
       return proxy_url_prefix + protocol + '/' + rest;
     }
     if (url.startsWith('//')) {
-      if (url.toLowerCase().startsWith('//' + proxyHostNoScheme.toLowerCase())) return url;
+      if (isProxyHostURL(url)) return url;
       return proxy_url_prefix + 'https/' + url.substring(2);
     }
     if (url.startsWith('/')) {
       if (!proxy_real_host) return url;
+      var stripped = stripProxyPrefixPath(url);
+      if (stripped !== null && /^(https?)\//.test(stripped)) return url;
       return proxy_url_prefix + proxy_real_protocol + '/' + proxy_real_host + url;
     }
 
@@ -113,9 +163,10 @@
       var base = realBaseURL() || (proxy_real_protocol + '://' + proxy_real_host + '/');
       var resolved = new URL(url, base);
       if (resolved.origin === location.origin ||
-          resolved.host === proxyHostNoScheme) {
+          resolved.host === proxyHostFull) {
         // Resolved onto the proxy origin: re-anchor into the site scope.
-        if (token_prefix !== '/' && resolved.pathname.startsWith(token_prefix)) return url;
+        var rp = stripProxyPrefixPath(resolved.pathname);
+        if (rp !== null && /^(https?)\//.test(rp)) return url;
         return proxy_url_prefix + proxy_real_protocol + '/' + proxy_real_host +
                resolved.pathname + resolved.search + resolved.hash;
       }
@@ -134,12 +185,13 @@
   function unRewriteURL(url) {
     if (typeof url !== 'string') return url;
     var path = null;
-    if (url.startsWith(proxy_url_prefix)) {
+    if (url.toLowerCase().startsWith(proxy_url_prefix.toLowerCase())) {
       path = url.substring(proxy_url_prefix.length);
-    } else if (url.startsWith('/') && token_prefix !== '/' &&
-               url.startsWith(token_prefix)) {
-      path = url.substring(token_prefix.length);
-    } else {
+    } else if (url.startsWith('/')) {
+      var stripped = stripProxyPrefixPath(url);
+      if (stripped !== null && /^(https?)\//.test(stripped)) path = stripped;
+    }
+    if (path === null) {
       // Same-origin (proxy) URL without the token scope: map through the
       // current site context (upstream unrewrite fallback).
       try {
@@ -177,13 +229,12 @@
 
     // Parse the proxied URL into its real parts.
     function siteParts() {
-      var path = realLocation.pathname;
-      if (token_prefix !== '/' && path.startsWith(token_prefix)) {
-        path = path.substring(token_prefix.length);
+      var path = stripProxyPrefixPath(realLocation.pathname);
+      if (path !== null) {
+        var m = path.match(/^(https?)\/([^/]+)(\/.*)?$/);
+        if (m) return { protocol: m[1], host: m[2], pathname: m[3] || '/' };
       }
-      var m = path.match(/^(https?)\/([^/]+)(\/.*)?$/);
-      if (m) return { protocol: m[1], host: m[2], pathname: m[3] || '/' };
-      return { protocol: proxy_real_protocol, host: proxy_real_host, pathname: path };
+      return { protocol: proxy_real_protocol, host: proxy_real_host, pathname: '/' };
     }
 
     function Wrapper(target) {
@@ -243,6 +294,10 @@
       hostname: {
         get: function () {
           var h = siteParts().host;
+          if (h.charAt(0) === '[') {
+            var end = h.indexOf(']');
+            if (end !== -1) return h.substring(0, end + 1);
+          }
           var i = h.indexOf(':');
           return i >= 0 ? h.substring(0, i) : h;
         },
@@ -251,7 +306,13 @@
       port: {
         get: function () {
           var h = siteParts().host;
-          var i = h.indexOf(':');
+          var start = 0;
+          if (h.charAt(0) === '[') {
+            var end = h.indexOf(']');
+            if (end === -1) return '';
+            start = end + 1;
+          }
+          var i = h.indexOf(':', start);
           return i >= 0 ? h.substring(i + 1) : '';
         },
         set: function () { /* upstream: no-op */ }
@@ -345,7 +406,7 @@
   var originalOpen = window.open ? window.open.bind(window) : null;
   if (originalOpen) {
     window.open = function (url, name, specs) {
-      if (typeof url === 'string') url = proxyRewrite(url);
+      if (typeof url === 'string' || url instanceof URL) url = proxyRewrite(String(url));
       return originalOpen(url, name, specs);
     };
   }
@@ -360,12 +421,9 @@
         } else if (input && typeof input.url === 'string') {
           var newUrl = proxyRewrite(input.url);
           if (newUrl !== input.url) {
-            var cloned = new Request(newUrl, { method: input.method, headers: input.headers,
-                                               body: input.body, mode: 'same-origin',
-                                               credentials: input.credentials,
-                                               cache: input.cache, redirect: input.redirect,
-                                               referrer: input.referrer, integrity: '' });
-            input = cloned;
+            // Preserve method/headers/body/mode/credentials/signal/keepalive
+            // etc. by using the original Request as the init.
+            input = new Request(newUrl, input);
           }
         }
         init = init || {};
@@ -388,7 +446,7 @@
     XMLHttpRequest.prototype.open = function (method, url) {
       this.__siteproxy_real_url = url;
       var args = Array.prototype.slice.call(arguments);
-      if (typeof url === 'string') args[1] = proxyRewrite(url);
+      if (typeof url === 'string' || url instanceof URL) args[1] = proxyRewrite(String(url));
       return OriginalOpen.apply(this, args);
     };
     XMLHttpRequest.prototype.send = function (body) {
@@ -407,11 +465,16 @@
     if (!window.WebSocket) return;
     var OriginalWebSocket = window.WebSocket;
     function SiteProxyWebSocket(url, protocols) {
-      if (typeof url === 'string') {
-        var httpUrl = url.replace(/^wss:/i, 'https:').replace(/^ws:/i, 'http:');
-        url = proxyRewrite(httpUrl);
-      } else if (url instanceof OriginalWebSocket) {
-        url = url.url; // best effort
+      var target = url;
+      if (target instanceof URL) target = target.href;
+      if (typeof target === 'string') {
+        var httpUrl = target.replace(/^wss:/i, 'https:').replace(/^ws:/i, 'http:');
+        var proxied = proxyRewrite(httpUrl);
+        // The native constructor only accepts ws:/wss: (Chrome/Firefox throw
+        // on https:), so convert the proxied URL back after rewriting.
+        url = proxied.replace(/^https:/i, 'wss:').replace(/^http:/i, 'ws:');
+      } else if (target instanceof OriginalWebSocket) {
+        url = target.url; // best effort
       }
       if (protocols === undefined) return new OriginalWebSocket(url);
       return new OriginalWebSocket(url, protocols);
@@ -432,7 +495,7 @@
     if (!window.EventSource) return;
     var OriginalEventSource = window.EventSource;
     function SiteProxyEventSource(url, cfg) {
-      if (typeof url === 'string') url = proxyRewrite(url);
+      if (typeof url === 'string' || url instanceof URL) url = proxyRewrite(String(url));
       if (cfg === undefined) return new OriginalEventSource(url);
       return new OriginalEventSource(url, cfg);
     }
@@ -448,7 +511,7 @@
     if (!navigator.sendBeacon) return;
     var originalSendBeacon = navigator.sendBeacon.bind(navigator);
     navigator.sendBeacon = function (url, data) {
-      if (typeof url === 'string') url = proxyRewrite(url);
+      if (typeof url === 'string' || url instanceof URL) url = proxyRewrite(String(url));
       return originalSendBeacon(url, data);
     };
   })();
@@ -458,11 +521,17 @@
     try {
       var realURL = unRewriteURL(location.href);
       if (realURL !== location.href) {
-        Object.defineProperty(document, 'URL', { get: function () { return realURL; }, configurable: true });
-        Object.defineProperty(document, 'documentURI', { get: function () { return realURL; }, configurable: true });
-        var realHost = realURL.split('://')[1] || '';
-        if (realHost.indexOf('/') >= 0) realHost = realHost.split('/')[0];
-        Object.defineProperty(document, 'domain', { get: function () { return realHost; }, configurable: true });
+        // Dynamic getters: SPA pushState/replaceState changes must be visible.
+        Object.defineProperty(document, 'URL', { get: function () { return window.___location.href; }, set: function (v) { window.___location.href = v; }, configurable: true });
+        Object.defineProperty(document, 'documentURI', { get: function () { return window.___location.href; }, configurable: true });
+        Object.defineProperty(document, 'domain', {
+          get: function () {
+            var u = unRewriteURL(document.URL);
+            var host = String(u).split('://')[1] || '';
+            return host.split('/')[0];
+          },
+          configurable: true
+        });
       }
     } catch (e) { /* ignore */ }
   })();
@@ -476,11 +545,6 @@
       return Promise.reject(new DOMException('requestStorageAccessFor blocked by proxy', 'SecurityError'));
     }
     try {
-      if (typeof document.requestStorageAccessFor === 'function') {
-        document.requestStorageAccessFor = blockedStorageAccess;
-      }
-    } catch (e) { /* ignore */ }
-    try {
       delete document.___requestStorageAccessFor;
       Object.defineProperty(document, '___requestStorageAccessFor', {
         value: blockedStorageAccess, writable: false, configurable: true
@@ -492,7 +556,7 @@
   // 6. document.cookie trap (clientCookieModify, ported from upstream).
   // ------------------------------------------------------------------
   (function () {
-    var cookiePath = token_prefix;
+    var cookiePath = proxyBasePath + token_prefix;
     if (cookiePath.charAt(cookiePath.length - 1) !== '/') cookiePath += '/';
     cookiePath += proxy_real_protocol + '/' + proxy_real_host + '/';
     if (cookiePath.charAt(0) !== '/') cookiePath = '/' + cookiePath;
@@ -647,10 +711,8 @@
       Object.defineProperty(window, '___siteproxyRealSW', {
         value: realSW, writable: false, configurable: true
       });
-      // navigator.serviceWorker -> undefined for page code.
-      Object.defineProperty(navigator, 'serviceWorker', {
-        get: function () { return undefined; }, configurable: true
-      });
+      // navigator.serviceWorker stays native (upstream leaves it alone); page
+      // call sites are rewritten to the ___-prefixed blocking stub below.
       // navigator.___serviceWorker (rewritten call sites) -> blocking stub,
       // exactly like the upstream fake registration object.
       var never = new Promise(function () {}); never.catch(function () {});
@@ -674,7 +736,11 @@
       console.warn('[siteproxy] Failed to define navigator service worker shims:', e);
       return;
     }
-    realSW.register('/siteproxy_service_worker.js', { scope: '/' }).catch(function (err) {
+    if (!proxy_real_host) return; // homepage: no target site context yet
+    var swURL = '/siteproxy_service_worker.js?proxy_real_protocol=' +
+      encodeURIComponent(proxy_real_protocol) + '&proxy_real_host=' +
+      encodeURIComponent(proxy_real_host) + '&v=4';
+    realSW.register(swURL, { scope: '/' }).catch(function (err) {
       console.warn('[siteproxy] service worker registration failed:', err);
     });
   })();
@@ -696,17 +762,21 @@
   // ------------------------------------------------------------------
   // 9. Runtime DOM rewriting (belt & braces with the server rewriter).
   // ------------------------------------------------------------------
-  var URL_ATTRS = { href: 1, src: 1, action: 1, poster: 1, formaction: 1, cite: 1, manifest: 1, 'data-url': 1, 'data-src': 1 };
+  var URL_ATTRS = {
+    href: 1, src: 1, action: 1, poster: 1, formaction: 1, cite: 1,
+    manifest: 1, data: 1, dynsrc: 1, lowsrc: 1,
+    'data-url': 1, 'data-src': 1, 'data-href': 1,
+    'data-background': 1, 'data-original': 1
+  };
   var SRCSET_ATTRS = { srcset: 1, imagesrcset: 1 };
 
-  function rewriteElement(el) {
-    if (!el || el.__siteproxy_traversed) return;
-    el.__siteproxy_traversed = true;
+  function rewriteElement(el, force) {
+    if (!el) return;
+    if (!force && el.__siteproxy_traversed) return;
+    if (!force) el.__siteproxy_traversed = true;
+    var tag = String(el.tagName || '').toUpperCase();
     try {
-      if (el.tagName === 'IFRAME' || el.tagName === 'SCRIPT' || el.tagName === 'LINK' ||
-          el.tagName === 'IMG' || el.tagName === 'A' || el.tagName === 'FORM' ||
-          el.tagName === 'SOURCE' || el.tagName === 'VIDEO' || el.tagName === 'AUDIO' ||
-          el.tagName === 'EMBED' || el.tagName === 'BLOCKQUOTE') {
+      if (el.hasAttribute) {
         for (var attr in URL_ATTRS) {
           if (el.hasAttribute(attr)) {
             var v = el.getAttribute(attr);
@@ -717,38 +787,177 @@
         for (var sattr in SRCSET_ATTRS) {
           if (el.hasAttribute(sattr)) {
             var sv = el.getAttribute(sattr);
-            var parts = sv.split(',').map(function (p) {
-              var f = p.trim().split(/\s+/);
-              if (f.length && f[0]) f[0] = proxyRewrite(f[0]);
-              return f.join(' ');
-            });
-            el.setAttribute(sattr, parts.join(', '));
+            var nsv = rewriteSrcsetValue(sv);
+            if (nsv !== sv) el.setAttribute(sattr, nsv);
           }
         }
-        if (el.hasAttribute('integrity')) el.removeAttribute('integrity');
-        if (el.hasAttribute('crossorigin')) el.removeAttribute('crossorigin');
+        if (tag === 'SCRIPT' || tag === 'LINK' || tag === 'IFRAME') {
+          if (el.hasAttribute('integrity')) el.removeAttribute('integrity');
+          if (el.hasAttribute('crossorigin')) el.removeAttribute('crossorigin');
+        }
+        if (el.hasAttribute('style')) {
+          var styleValue = el.getAttribute('style');
+          var styleRewritten = rewriteCSSUrls(styleValue);
+          if (styleRewritten !== styleValue) el.setAttribute('style', styleRewritten);
+        }
       }
-      if (el.tagName === 'STYLE' && el.textContent && el.textContent.indexOf('url(') >= 0) {
-        el.textContent = rewriteCSSUrls(el.textContent);
-      }
-      if (el.hasAttribute && el.hasAttribute('style') &&
-          el.getAttribute('style').indexOf('url(') >= 0) {
-        el.setAttribute('style', rewriteCSSUrls(el.getAttribute('style')));
+      if (tag === 'STYLE' && el.textContent) {
+        var cssText = rewriteCSSUrls(el.textContent);
+        if (cssText !== el.textContent) el.textContent = cssText;
       }
     } catch (e) { /* ignore single-node failures */ }
   }
 
   function rewriteCSSUrls(css) {
-    return css.replace(/url\(\s*(['"]?)([^)'"]+)(['"]?)\s*\)/gi, function (m, q, u, q2) {
-      if (/^(data:|blob:|#)/i.test(u)) return m;
-      return 'url(' + q + proxyRewrite(u) + q2 + ')';
+    // Handles normal quotes and the HTML-entity quotes some sites emit
+    // inside url(...), matching the server-side splitCSSURLQuotes logic.
+    return css.replace(/url\(\s*([^)]*?)\s*\)/gi, function (m, inner) {
+      var quote = '';
+      var u = inner;
+      var lower = inner.toLowerCase();
+      if (/^["']/.test(inner)) {
+        if (inner.length < 2 || inner.charAt(inner.length - 1) !== inner.charAt(0)) return m;
+        quote = inner.charAt(0);
+        u = inner.slice(1, -1);
+        // url('&quot;/x&quot;'): ambiguous, leave untouched (upstream parity).
+        if (/^(&quot;|&#34;|&apos;|&#39;)/i.test(u)) return m;
+      } else {
+        var entities = ['&quot;', '&#34;', '&apos;', '&#39;'];
+        for (var i = 0; i < entities.length; i++) {
+          var q = entities[i];
+          if (lower.indexOf(q) === 0) {
+            if (inner.length <= q.length * 2 || lower.slice(-q.length) !== q) return m;
+            quote = inner.slice(0, q.length);
+            u = inner.slice(q.length, inner.length - q.length);
+            break;
+          }
+          if (lower.slice(-q.length) === q) return m;
+        }
+      }
+      if (!u || /^(data:|blob:|#)/i.test(u)) return m;
+      if (!quote && /\s/.test(u)) return m;
+      return 'url(' + quote + proxyRewrite(u) + quote + ')';
+    }).replace(/(["'])((?:https?:\/\/|\/\/|\/)[^"'\s]*)["']/gi, function (m, quote, u) {
+      // Quoted URLs outside url(), e.g. image-set("... 1x").
+      return quote + proxyRewrite(u) + quote;
     });
   }
 
+  // Source-set parser ported from upstream `_0x4898df`: the URL token runs
+  // until the first whitespace so commas inside data URIs are preserved.
+  function rewriteSrcsetValue(value) {
+    var isWS = function (c) {
+      return c === ' ' || c === '\t' || c === '\n' || c === '\r' || c === '\f';
+    };
+    var out = '';
+    var i = 0;
+    var n = value.length;
+    while (i < n) {
+      var start = i;
+      while (i < n && (isWS(value[i]) || value[i] === ',')) i++;
+      out += value.slice(start, i);
+      if (i >= n) break;
+      var urlStart = i;
+      while (i < n && !isWS(value[i])) i++;
+      var url = value.slice(urlStart, i);
+      var commas = 0;
+      while (url.length && url.charAt(url.length - 1) === ',') {
+        url = url.slice(0, -1);
+        commas++;
+      }
+      out += proxyRewrite(url);
+      out += value.slice(i - commas, i);
+      if (commas) continue;
+      var descStart = i;
+      while (i < n && value[i] !== ',') i++;
+      out += value.slice(descStart, i);
+    }
+    return out;
+  }
+
+  function rewriteAttrValue(name, value) {
+    if (typeof value !== 'string') return value;
+    var ln = String(name).toLowerCase();
+    if (ln === 'style') return rewriteCSSUrls(value);
+    if (ln === 'srcset' || ln === 'imagesrcset') return rewriteSrcsetValue(value);
+    if (URL_ATTRS[ln]) return proxyRewrite(value);
+    return value;
+  }
+
+  // Property setters additionally cover HTMLObjectElement.data.
+  function rewritePropertyValue(name, value) {
+    if (String(name).toLowerCase() === 'data') return proxyRewrite(value);
+    return rewriteAttrValue(name, value);
+  }
+
+  // Synchronous URL property setters (upstream rewrites `img.src = ...`,
+  // `script.src = ...`, `a.href = ...` before the browser can start a
+  // request). MutationObserver alone is too late for direct property writes.
+  (function () {
+    var props = ['src', 'href', 'action', 'formAction', 'poster', 'data', 'cite',
+      'dynsrc', 'lowsrc', 'srcset', 'imagesrcset', 'data-src',
+      'manifest', 'style'];
+    var protos = ['HTMLElement', 'HTMLImageElement', 'HTMLAnchorElement',
+      'HTMLScriptElement', 'HTMLLinkElement', 'HTMLFormElement',
+      'HTMLSourceElement', 'HTMLVideoElement', 'HTMLAudioElement',
+      'HTMLIFrameElement', 'HTMLEmbedElement', 'HTMLObjectElement',
+      'HTMLQuoteElement', 'HTMLModElement', 'HTMLInputElement',
+      'HTMLButtonElement', 'HTMLTrackElement', 'HTMLAreaElement',
+      'HTMLBaseElement', 'HTMLHtmlElement'];
+    for (var p = 0; p < protos.length; p++) {
+      var proto = window[protos[p]] && window[protos[p]].prototype;
+      if (!proto) continue;
+      for (var a = 0; a < props.length; a++) {
+        (function (prop) {
+          var d = Object.getOwnPropertyDescriptor(proto, prop);
+          if (!d || !d.set) return;
+          try {
+            Object.defineProperty(proto, prop, {
+              get: d.get,
+              set: function (v) { return d.set.call(this, rewritePropertyValue(prop, v)); },
+              configurable: true,
+              enumerable: d.enumerable
+            });
+          } catch (e) { /* non-configurable in this engine */ }
+        })(props[a]);
+      }
+    }
+  })();
+
+  (function () {
+    try {
+      var inner = Object.getOwnPropertyDescriptor(Element.prototype, 'innerHTML');
+      if (inner && inner.set) {
+        Object.defineProperty(Element.prototype, 'innerHTML', {
+          get: inner.get,
+          set: function (v) { inner.set.call(this, v); traverse(this); },
+          configurable: true,
+          enumerable: inner.enumerable
+        });
+      }
+      var insert = Element.prototype.insertAdjacentHTML;
+      if (insert) {
+        Element.prototype.insertAdjacentHTML = function (pos, html) {
+          var tmp = document.createElement('div');
+          tmp.innerHTML = html;
+          return insert.call(this, pos, tmp.innerHTML);
+        };
+      }
+      var clone = Node.prototype.cloneNode;
+      if (clone) {
+        Node.prototype.cloneNode = function (deep) {
+          var node = clone.call(this, deep);
+          if (node.nodeType === 1) rewriteElement(node);
+          traverse(node);
+          return node;
+        };
+      }
+    } catch (e) { /* ignore */ }
+  })();
+
   function traverse(root) {
     try {
-      var all = (root || document).querySelectorAll(
-        'a[href],script[src],link[href],img,iframe,form,source,video,audio,embed,style,[style*="url("]');
+      var all = (root || document).querySelectorAll('*');
       for (var i = 0; i < all.length; i++) rewriteElement(all[i]);
     } catch (e) { /* ignore */ }
   }
@@ -769,13 +978,18 @@
         if (node.querySelectorAll) traverse(node);
       }
       if (mutations[i].type === 'attributes') {
-        rewriteElement(mutations[i].target);
+        // Force: the element may have been traversed already, but a CSSOM
+        // style change or setAttributeNS still needs URL rewriting.
+        rewriteElement(mutations[i].target, true);
       }
     }
   });
   mo.observe(document.documentElement || document, {
     childList: true, subtree: true, attributes: true,
-    attributeFilter: ['href', 'src', 'action', 'srcset', 'imagesrcset', 'poster', 'style']
+    attributeFilter: ['href', 'src', 'action', 'formaction', 'srcset', 'imagesrcset',
+      'poster', 'cite', 'manifest', 'data', 'dynsrc', 'lowsrc',
+      'data-url', 'data-src', 'data-href', 'data-background', 'data-original',
+      'integrity', 'crossorigin', 'style']
   });
 
   // Form submit hook: rewrite action at submit time.
@@ -803,25 +1017,16 @@
       Element.prototype.setAttribute = function (name, value) {
         try {
           var ln = String(name).toLowerCase();
+          var tag = String(this.tagName || '').toUpperCase();
           if (typeof value === 'string' && (URL_ATTRS[ln] || SRCSET_ATTRS[ln])) {
-            var tag = this.tagName;
             if (tag === 'SCRIPT' || tag === 'LINK' || tag === 'IFRAME') {
               try { this.removeAttribute('integrity'); } catch (e) { /* ignore */ }
             }
           }
-          if (typeof value === 'string' && URL_ATTRS[ln]) {
-            var nv = proxyRewrite(value);
-            if (nv !== value) value = nv;
-          } else if (typeof value === 'string' && SRCSET_ATTRS[ln]) {
-            var parts = value.split(',').map(function (p) {
-              var f = p.trim().split(/\s+/);
-              if (f.length && f[0]) f[0] = proxyRewrite(f[0]);
-              return f.join(' ');
-            });
-            value = parts.join(', ');
-          }
+          var rewritten = rewriteAttrValue(ln, value);
+          if (rewritten !== value) value = rewritten;
           if (ln === 'integrity' &&
-              (this.tagName === 'SCRIPT' || this.tagName === 'LINK' || this.tagName === 'IFRAME')) {
+              (tag === 'SCRIPT' || tag === 'LINK' || tag === 'IFRAME')) {
             return undefined; // never install SRI on proxied (rewritten) bodies
           }
         } catch (e) { /* fallthrough to native */ }
@@ -871,6 +1076,8 @@
   window.___siteproxy = {
     proxyRewrite: proxyRewrite,
     unRewriteURL: unRewriteURL,
+    rewriteCSSUrls: rewriteCSSUrls,
+    rewriteSrcsetValue: rewriteSrcsetValue,
     get realLocation() { return { protocol: proxy_real_protocol, host: proxy_real_host }; }
   };
 })();

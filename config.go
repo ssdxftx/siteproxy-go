@@ -8,6 +8,8 @@ import (
 	"strings"
 )
 
+const defaultTokenPrefix = "/user22334455/"
+
 // Config mirrors the original siteproxy config.json so that existing users
 // can switch to the Go binary without touching their configuration.
 type Config struct {
@@ -16,7 +18,8 @@ type Config struct {
 	ProxyURL string `json:"proxy_url"`
 
 	// TokenPrefix is the "password" embedded in every proxied URL, it must
-	// start and end with "/". Empty string or "/" means no password.
+	// start and end with "/". An empty value uses the upstream default
+	// password; only an explicit "/" disables authentication.
 	TokenPrefix string `json:"token_prefix"`
 
 	// LocalListenPort is the HTTP port this server listens on.
@@ -39,7 +42,7 @@ type Config struct {
 func LoadConfig(path string) (*Config, error) {
 	cfg := &Config{
 		ProxyURL:        "http://localhost:5006",
-		TokenPrefix:     "/user22334455/",
+		TokenPrefix:     defaultTokenPrefix,
 		LocalListenPort: 5006,
 	}
 
@@ -82,11 +85,15 @@ func (c *Config) normalize() (*Config, error) {
 	if c.ProxyURL == "" {
 		c.ProxyURL = "http://localhost:5006"
 	}
-	if u, err := url.Parse(c.ProxyURL); err != nil || u.Host == "" {
-		return nil, fmt.Errorf("invalid proxy_url %q", c.ProxyURL)
+	if u, err := url.Parse(c.ProxyURL); err != nil || u.Host == "" || u.User != nil ||
+		(u.Scheme != "http" && u.Scheme != "https") || u.RawQuery != "" || u.Fragment != "" {
+		return nil, fmt.Errorf("invalid proxy_url %q (need an absolute http(s) URL without query/fragment)", c.ProxyURL)
 	}
 
 	c.TokenPrefix = normalizeTokenPrefix(c.TokenPrefix)
+	if strings.ContainsAny(c.TokenPrefix, " \t\r\n?#") {
+		return nil, fmt.Errorf("invalid token_prefix %q (whitespace, ? and # are not allowed)", c.TokenPrefix)
+	}
 
 	if c.LocalListenPort <= 0 {
 		c.LocalListenPort = 5006
@@ -119,10 +126,14 @@ func (c *Config) normalize() (*Config, error) {
 }
 
 // normalizeTokenPrefix ensures the prefix starts and ends with "/".
-// "/", "" and "///" all mean "no password".
+// An empty value falls back to the upstream default password; only an explicit
+// "/" disables authentication.
 func normalizeTokenPrefix(p string) string {
 	p = strings.TrimSpace(p)
-	if p == "" || p == "/" {
+	if p == "" {
+		return defaultTokenPrefix
+	}
+	if p == "/" {
 		return "/"
 	}
 	if !strings.HasPrefix(p, "/") {
@@ -138,7 +149,7 @@ func normalizeTokenPrefix(p string) string {
 // domain entry. Path-style entries (containing "/") are matched by
 // IsBlockedURL instead, mirroring the upstream substring semantics.
 func (c *Config) IsBlocked(host string) bool {
-	host = strings.ToLower(host)
+	host = hostWithoutPort(strings.ToLower(host))
 	host = strings.TrimSuffix(host, ".")
 	for _, b := range c.BlockedSites {
 		if strings.Contains(b, "/") {
@@ -149,6 +160,22 @@ func (c *Config) IsBlocked(host string) bool {
 		}
 	}
 	return false
+}
+
+// hostWithoutPort strips a numeric port from a host (including bracketed
+// IPv6 literals) so domain block entries match target URLs like
+// "elcomercio.pe:443". A bare IPv6 literal is returned with its brackets.
+func hostWithoutPort(host string) string {
+	if strings.HasPrefix(host, "[") {
+		if i := strings.IndexByte(host, ']'); i >= 0 {
+			return host[:i+1]
+		}
+		return host
+	}
+	if i := strings.LastIndexByte(host, ':'); i >= 0 && strings.Count(host, ":") == 1 {
+		return host[:i]
+	}
+	return host
 }
 
 // IsBlockedURL checks path-style block entries (e.g.
@@ -162,6 +189,17 @@ func (c *Config) IsBlockedURL(fullURL string) bool {
 		}
 	}
 	return false
+}
+
+// BasePath returns the path component of proxy_url without a trailing
+// slash ("" for a root deployment). Cookie paths must include it so a proxy
+// deployed under /sub still receives its own cookies.
+func (c *Config) BasePath() string {
+	u, err := url.Parse(c.ProxyURL)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimRight(u.Path, "/")
 }
 
 // noPassword reports whether token authentication is disabled.

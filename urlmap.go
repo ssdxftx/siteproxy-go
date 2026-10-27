@@ -49,11 +49,7 @@ func ParseTarget(path, rawQuery string) *TargetInfo {
 		return nil
 	}
 	host := m[2]
-	if i := strings.Index(host, "@"); i >= 0 {
-		return nil // userinfo smuggle
-	}
-	// Reject obviously invalid hosts (empty, no dot or colon).
-	if host == "" || (!strings.Contains(host, ".") && !strings.Contains(host, ":")) {
+	if !isPlausibleHost(host) {
 		return nil
 	}
 	rest := m[3]
@@ -115,8 +111,8 @@ func RewriteURL(rawURL, publicPrefix, proxyHost string) string {
 	if rawURL == "" {
 		return rawURL
 	}
-	if strings.HasPrefix(rawURL, publicPrefix) {
-		return rawURL // already proxied
+	if strings.HasPrefix(strings.ToLower(rawURL), strings.ToLower(publicPrefix)) {
+		return rawURL // already proxied (case-insensitive scheme/host)
 	}
 	if proxyHost != "" && strings.EqualFold(hostOfURL(rawURL), proxyHost) {
 		return rawURL
@@ -139,8 +135,22 @@ func RewriteWithBase(rawURL, publicPrefix, baseProxiedURL, proxyHost string) str
 	if rawURL == "" {
 		return rawURL
 	}
-	trimmed := strings.TrimSpace(rawURL)
+	if rawURL == "" || strings.ContainsAny(rawURL, " \t\r\n\f\v") {
+		// Empty / whitespace-containing attribute values are not URLs; the
+		// upstream regexes deliberately do not rewrite them.
+		return rawURL
+	}
+	trimmed := rawURL
 	lower := strings.ToLower(trimmed)
+	if hasUnsupportedScheme(trimmed) {
+		return rawURL
+	}
+	if tokenPrefix := tokenPrefixOf(publicPrefix); tokenPrefix != "" && tokenPrefix != "/" &&
+		strings.HasPrefix(trimmed, tokenPrefix) {
+		// Already inside the proxy scope (but without the absolute proxy
+		// host): never wrap it a second time.
+		return rawURL
+	}
 	switch {
 	// Do not touch non-http schemes.
 	case strings.HasPrefix(lower, "javascript:") ||
@@ -160,6 +170,9 @@ func RewriteWithBase(rawURL, publicPrefix, baseProxiedURL, proxyHost string) str
 		if host == "" {
 			return rawURL
 		}
+		if proxyHost != "" && strings.EqualFold(host, proxyHost) {
+			return rawURL // protocol-relative URL pointing at the proxy itself
+		}
 		return publicPrefix + "https/" + trimmed[2:]
 	case strings.HasPrefix(trimmed, "/"):
 		proto, host := baseOf(baseProxiedURL, publicPrefix)
@@ -168,6 +181,13 @@ func RewriteWithBase(rawURL, publicPrefix, baseProxiedURL, proxyHost string) str
 		}
 		return publicPrefix + proto + "/" + host + trimmed
 	default:
+		// Resolve dot segments, query-only references (?page=2) and relative
+		// paths exactly like a browser would.
+		if base, err := url.Parse(baseProxiedURL); err == nil && base.IsAbs() {
+			if ref, err := url.Parse(trimmed); err == nil {
+				return base.ResolveReference(ref).String()
+			}
+		}
 		proto, host := baseOf(baseProxiedURL, publicPrefix)
 		if host == "" {
 			return rawURL
@@ -181,14 +201,70 @@ func RewriteWithBase(rawURL, publicPrefix, baseProxiedURL, proxyHost string) str
 	}
 }
 
+// hasUnsupportedScheme reports whether rawURL uses a non-http(s) scheme (ftp:,
+// sms:, file:, chrome-extension:, vbscript:, ...). Those are returned
+// unchanged, like the original server does for every `^[a-z]+:` value.
+func hasUnsupportedScheme(rawURL string) bool {
+	colon := strings.IndexByte(rawURL, ':')
+	if colon <= 0 {
+		return false
+	}
+	if slash := strings.IndexAny(rawURL, "/?#"); slash >= 0 && slash < colon {
+		return false
+	}
+	scheme := rawURL[:colon]
+	for i := 0; i < len(scheme); i++ {
+		c := scheme[i]
+		alpha := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+		if !alpha && !(i > 0 && ((c >= '0' && c <= '9') || c == '+' || c == '-' || c == '.')) {
+			return false
+		}
+	}
+	switch strings.ToLower(scheme) {
+	case "http", "https":
+		// "http:foo" is not a web URL and must not be treated as a relative
+		// path; only scheme:// forms are proxied.
+		return !strings.HasPrefix(strings.ToLower(rawURL), strings.ToLower(scheme)+"://")
+	}
+	return true
+}
+
+// tokenPrefixOf extracts the token part from "{proxy_url}{token_prefix}".
+func tokenPrefixOf(publicPrefix string) string {
+	i := strings.Index(publicPrefix, "://")
+	if i < 0 {
+		return ""
+	}
+	rest := publicPrefix[i+3:]
+	j := strings.IndexByte(rest, '/')
+	if j < 0 {
+		return ""
+	}
+	return rest[j:]
+}
+
 // UnrewriteURL converts a proxied URL back into the real target URL. Used for
 // Referer / Origin reconstruction.
 func UnrewriteURL(u, tokenPrefix string) string {
+	return UnrewriteURLWithBase(u, tokenPrefix, "")
+}
+
+// UnrewriteURLWithBase is UnrewriteURL for a proxy deployed under basePath
+// (e.g. "/sub"). The base path is stripped before the token prefix.
+func UnrewriteURLWithBase(u, tokenPrefix, basePath string) string {
 	parsed, err := url.Parse(u)
 	if err != nil {
 		return u
 	}
-	rest := parsed.Path
+	// EscapedPath keeps %2F and other encoded bytes intact; parsed.Path
+	// would decode them and change the real target URL.
+	rest := parsed.EscapedPath()
+	if basePath != "" && (rest == basePath || strings.HasPrefix(rest, basePath+"/")) {
+		rest = strings.TrimPrefix(rest, basePath)
+		if rest == "" {
+			rest = "/"
+		}
+	}
 	if tokenPrefix != "/" {
 		if !strings.HasPrefix(rest, tokenPrefix) {
 			return u

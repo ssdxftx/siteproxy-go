@@ -26,17 +26,30 @@ var (
 	sniffWindowBytes  = 4096
 	supportedCharset  = regexp.MustCompile(`(?i)^(gb2312|gbk|gb18030|big5|big5-hkscs|shift[_-]?jis|sjis|euc-?jp|euc-?kr|iso-?8859-[0-9]+|windows-12[0-9][0-9]|koi8-[ru]|latin[1-9])$`)
 	utf16CharsetNames = regexp.MustCompile(`(?i)^utf-?16(le|be|)?$`)
+
+	metaTagRe            = regexp.MustCompile(`(?is)<meta(?:[^>"']|"[^"]*"|'[^']*')*>`)
+	metaContentTypeTagRe = regexp.MustCompile(`(?is)<meta\s+(?:[^>]*?\s)?http-equiv\s*=\s*["']?Content-Type["']?[^>]*>`)
+	metaCharsetAttrRe    = regexp.MustCompile(`(?i)charset\s*=\s*["']?[0-9a-zA-Z_\-]+["']?`)
 )
+
+// rewriteCharsetMeta updates legacy charset declarations after transcoding so
+// the browser cannot override the UTF-8 response with the original GBK/etc.
+// This mirrors the upstream `_0x504211` helper.
+func rewriteCharsetMeta(html string) string {
+	return metaTagRe.ReplaceAllStringFunc(html, func(tag string) string {
+		if metaContentTypeTagRe.MatchString(tag) {
+			return charsetMetaSnippet
+		}
+		return metaCharsetAttrRe.ReplaceAllString(tag, `charset=UTF-8`)
+	})
+}
 
 // decodeHTMLBody transcodes a raw HTML body to a UTF-8 string.
 // The declared charset is resolved from (in order): the Content-Type header,
 // a BOM, the <meta charset> / <meta http-equiv=Content-Type> tag.
 // The second return value is the charset actually used ("" for UTF-8).
 func decodeHTMLBody(raw []byte, contentTypeHeader string) (string, string) {
-	if cs := charsetFromContentType(contentTypeHeader); cs != "" && !isUTF8(cs) {
-		return decodeBytes(raw, cs)
-	}
-	// BOM sniffing.
+	// BOM sniffing first: UTF-16 BOMs cannot be reliably scanned as ASCII.
 	switch {
 	case bytes.HasPrefix(raw, bomUTF16LE):
 		return decodeUTF16(raw, "utf-16le")
@@ -45,7 +58,8 @@ func decodeHTMLBody(raw []byte, contentTypeHeader string) (string, string) {
 	case bytes.HasPrefix(raw, bomUTF8):
 		return string(bytes.TrimPrefix(raw, bomUTF8)), ""
 	}
-	// Meta sniffing inside the first bytes.
+	// The upstream node pipeline gives an in-document meta charset priority
+	// over the HTTP header (browsers do the same for legacy documents).
 	window := raw
 	if len(window) > sniffWindowBytes {
 		window = window[:sniffWindowBytes]
@@ -62,6 +76,9 @@ func decodeHTMLBody(raw []byte, contentTypeHeader string) (string, string) {
 		if !isUTF8(cs) {
 			return decodeBytes(raw, cs)
 		}
+	}
+	if cs := charsetFromContentType(contentTypeHeader); cs != "" && !isUTF8(cs) {
+		return decodeBytes(raw, cs)
 	}
 	return string(raw), ""
 }
@@ -115,16 +132,16 @@ func decodeBytes(raw []byte, cs string) (string, string) {
 func decodeUTF16(raw []byte, cs string) (string, string) {
 	var name string
 	switch {
-	case strings.HasSuffix(cs, "le"):
-		name = "UTF-16LE"
-	case strings.HasSuffix(cs, "be"):
-		name = "UTF-16BE"
 	case bytes.HasPrefix(raw, bomUTF16LE):
 		name = "UTF-16LE"
 		raw = raw[2:]
 	case bytes.HasPrefix(raw, bomUTF16BE):
 		name = "UTF-16BE"
 		raw = raw[2:]
+	case strings.HasSuffix(cs, "le"):
+		name = "UTF-16LE"
+	case strings.HasSuffix(cs, "be"):
+		name = "UTF-16BE"
 	default:
 		name = "UTF-16BE" // RFC 2781 default without BOM
 	}
