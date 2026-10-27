@@ -1,0 +1,3 @@
+dist/
+siteproxy-go
+*.test

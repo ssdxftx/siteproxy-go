@@ -1,0 +1,16 @@
+services:
+  siteproxy:
+    build: .
+    image: siteproxy-go:latest
+    container_name: siteproxy-go
+    restart: unless-stopped
+    ports:
+      - "5006:5006"
+    volumes:
+      - ./config.json:/etc/siteproxy/config.json:ro
+    environment:
+      # 环境变量优先级高于 config.json（按需取消注释）
+      # - SITEPROXY_PROXY_URL=https://your-proxy.domain.name
+      # - SITEPROXY_TOKEN_PREFIX=/user-your-password/
+      # - SITEPROXY_LOCAL_LISTEN_PORT=5006
+      # - SITEPROXY_BLOCKED_SITES=a.com,b.com
