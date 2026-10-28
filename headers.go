@@ -40,6 +40,7 @@ var (
 		"Cross-Origin-Resource-Policy",
 		"X-Frame-Options", "Permissions-Policy", "Report-To",
 		"Reporting-Endpoints", "X-Xss-Protection",
+		"Nel", // Network Error Logging points at the upstream origin
 		"Clear-Site-Data", "Public-Key-Pins",
 		"Alt-Svc", "Alt-Used", // never advertise the upstream origin
 	}
@@ -261,6 +262,9 @@ func rewriteSetCookie(sc, token, sitePrefix string, cfg *Config) string {
 	}
 
 	// Extract attributes, dropping/rewriting the isolation-relevant ones.
+	// Attribute names are parsed with optional whitespace around '=' (e.g.
+	// "Path = /", "Domain = .example.com"): browsers accept that form, so a
+	// prefix-only match would let the isolation attributes bypass rewriting.
 	origPath := "/"
 	attrs := make([]string, 0, len(parts))
 	for _, p := range parts[1:] {
@@ -268,23 +272,34 @@ func rewriteSetCookie(sc, token, sitePrefix string, cfg *Config) string {
 		if p == "" {
 			continue
 		}
-		lower := strings.ToLower(p)
-		switch {
-		case strings.HasPrefix(lower, "domain="):
+		name, val := p, ""
+		if i := strings.IndexByte(p, '='); i >= 0 {
+			name = strings.TrimSpace(p[:i])
+			val = strings.TrimSpace(p[i+1:])
+		}
+		switch strings.ToLower(name) {
+		case "domain":
 			// drop: cookies become host-only on the proxy domain
-		case strings.HasPrefix(lower, "path="):
-			if v := p[len("path="):]; v != "" {
-				origPath = v
+		case "path":
+			if val != "" {
+				origPath = val
 			}
-		case lower == "secure":
+		case "secure":
 			if proxyIsHTTPS(cfg) {
 				attrs = append(attrs, "Secure")
 			}
-		case strings.HasPrefix(lower, "samesite="):
+		case "samesite":
 			attrs = append(attrs, "SameSite=Lax")
 		default:
 			attrs = append(attrs, p)
 		}
+	}
+
+	// A Path value without a leading slash is treated as absolute by the
+	// upstream (it prepends "/"); do the same so the isolation prefix is
+	// always well formed.
+	if !strings.HasPrefix(origPath, "/") {
+		origPath = "/" + origPath
 	}
 
 	base := cfg.BasePath() + token + sitePrefix

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -70,7 +71,9 @@ func (p *Proxy) proxyWebSocket(w http.ResponseWriter, r *http.Request, target *T
 		upstream, err = dialer.Dial("tcp", hostPort)
 	}
 	if err != nil {
-		writeRawResponse(clientConn, "502 Bad Gateway", "websocket dial failed: "+err.Error())
+		// Do not echo the dial error: it reveals the upstream host/port.
+		log.Printf("[siteproxy] websocket dial failed for %s: %v", target.Host, err)
+		writeRawResponse(clientConn, "502 Bad Gateway", "websocket dial failed")
 		return
 	}
 	defer upstream.Close()

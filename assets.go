@@ -38,13 +38,15 @@ func renderInjectedScript(cfg *Config, proto, host string) []byte {
 // node server injects before the external runtime (verbatim upstream text
 // with the config values baked in).
 func renderInlineBootstrap(cfg *Config, proto, host string) string {
-	s := string(assetsInline)
-	s = strings.ReplaceAll(s, "__PP__", jsEscape(cfg.ProxyURL+cfg.TokenPrefix))
-	s = strings.ReplaceAll(s, "__PROTO__", jsEscape(proto))
-	s = strings.ReplaceAll(s, "__HOST__", jsEscape(host))
-	s = strings.ReplaceAll(s, "__CURL__", jsEscape(cfg.ProxyURL))
-	s = strings.ReplaceAll(s, "__TOKEN__", jsEscape(cfg.TokenPrefix))
-	return s
+	// Single pass: a value that happens to contain another placeholder must
+	// not be substituted a second time.
+	return strings.NewReplacer(
+		"__PP__", jsEscape(cfg.ProxyURL+cfg.TokenPrefix),
+		"__PROTO__", jsEscape(proto),
+		"__HOST__", jsEscape(host),
+		"__CURL__", jsEscape(cfg.ProxyURL),
+		"__TOKEN__", jsEscape(cfg.TokenPrefix),
+	).Replace(string(assetsInline))
 }
 
 // renderServiceWorker bakes the config and the current site context into the

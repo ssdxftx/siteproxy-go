@@ -530,6 +530,10 @@
             var host = String(u).split('://')[1] || '';
             return host.split('/')[0];
           },
+          // Upstream defines a no-op setter: page scripts may still call
+          // document.domain = '...' (legacy cross-frame code) without the
+          // browser throwing or relaxing the proxy origin.
+          set: function () { /* upstream: no-op */ },
           configurable: true
         });
       }
@@ -737,10 +741,10 @@
       return;
     }
     if (!proxy_real_host) return; // homepage: no target site context yet
-    var swURL = '/siteproxy_service_worker.js?proxy_real_protocol=' +
+    var swURL = (proxyBasePath || '') + '/siteproxy_service_worker.js?proxy_real_protocol=' +
       encodeURIComponent(proxy_real_protocol) + '&proxy_real_host=' +
       encodeURIComponent(proxy_real_host) + '&v=4';
-    realSW.register(swURL, { scope: '/' }).catch(function (err) {
+    realSW.register(swURL, { scope: (proxyBasePath || '') + '/' }).catch(function (err) {
       console.warn('[siteproxy] service worker registration failed:', err);
     });
   })();

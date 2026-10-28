@@ -78,8 +78,19 @@ var (
 	charsetMetaSnippet = `<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">`
 )
 
-// injectedScriptTag is the external client runtime script tag (upstream v=4).
+// injectedScriptTag is the external client runtime script tag for a root
+// deployment (upstream v=4).
 const injectedScriptTag = `<script src="/siteproxy-response-injected.js?v=4"></script>`
+
+// injectedScriptTagAt builds the runtime script tag for a proxy mounted under
+// basePath ("" for root). The URL must include the base path or the browser
+// requests it outside the deployment prefix and gets a 404.
+func injectedScriptTagAt(basePath string) string {
+	if basePath == "" {
+		return injectedScriptTag
+	}
+	return `<script src="` + basePath + `/siteproxy-response-injected.js?v=4"></script>`
+}
 
 // attrValueRegex builds a three-branch attribute-value matcher (double
 // quoted, single quoted, unquoted). Group layout:
@@ -452,4 +463,28 @@ func injectScripts(html, injectSnippet string) string {
 		return html[:m[1]] + inject + html[m[1]:]
 	}
 	return inject + html
+}
+
+// injectSnippetBytes inserts an ASCII-only snippet into raw HTML bytes using
+// the same anchor priority as injectScripts, but WITHOUT prepending the UTF-8
+// charset meta. It is used for oversized bodies that stay in their original
+// charset (e.g. GBK): ASCII bytes are identical in all ASCII-compatible
+// encodings, so the rest of the document is untouched.
+func injectSnippetBytes(html []byte, snippet string) []byte {
+	insert := func(at int) []byte {
+		out := make([]byte, 0, len(html)+len(snippet))
+		out = append(out, html[:at]...)
+		out = append(out, snippet...)
+		out = append(out, html[at:]...)
+		return out
+	}
+	for _, re := range []*regexp.Regexp{injectAfterHeadRe, injectAfterHTMLRe, injectAfterBodyRe, firstClosingTagRe} {
+		if loc := re.FindIndex(html); loc != nil {
+			return insert(loc[1])
+		}
+	}
+	if loc := doctypeRe.FindIndex(html); loc != nil {
+		return insert(loc[1])
+	}
+	return insert(0)
 }

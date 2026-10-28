@@ -113,8 +113,6 @@ func (c *Config) normalize() (*Config, error) {
 		"telegram.org/service_worker.js",
 		"elcomercio.pe",
 		"exchangebank.com",
-		"www.visa.com.sg",
-		"netsuite.com",
 	} {
 		blocked[s] = true
 	}

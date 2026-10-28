@@ -294,7 +294,7 @@ func validPort(p string) bool {
 // same HTML rewriter used for proxied pages so the links stay inside the
 // proxy and the runtime scripts get injected.
 func (s *Server) serveHomepage(w http.ResponseWriter, r *http.Request) {
-	inject := renderInlineBootstrap(s.cfg, "https", "") + injectedScriptTag
+	inject := renderInlineBootstrap(s.cfg, "https", "") + injectedScriptTagAt(s.cfg.BasePath())
 	html := rewriteHTML(string(s.homepageHTML), s.cfg.ProxyURL+s.cfg.TokenPrefix,
 		s.cfg.ProxyURL+s.cfg.TokenPrefix, hostOfURL(s.cfg.ProxyURL), inject)
 	w.Header().Set("Content-Type", "text/html; charset=UTF-8")
@@ -328,7 +328,7 @@ func (s *Server) serveServiceWorker(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "siteproxy: render service worker: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-	s.serveStaticJS(w, r, body)
+	s.serveStaticJS(w, r, body, s.swAllowedScope())
 }
 
 // serveInjectedScript renders siteproxy-response-injected.js with the site
@@ -343,7 +343,16 @@ func (s *Server) serveInjectedScript(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	body := renderInjectedScript(s.cfg, proto, host)
-	s.serveStaticJS(w, r, body)
+	s.serveStaticJS(w, r, body, s.swAllowedScope())
+}
+
+// swAllowedScope returns the Service-Worker-Allowed value for a deployment:
+// the base path plus a trailing slash ("" base -> "/").
+func (s *Server) swAllowedScope() string {
+	if bp := s.cfg.BasePath(); bp != "" {
+		return bp + "/"
+	}
+	return "/"
 }
 
 // targetFromProxiedURL parses a proxied absolute URL back into a TargetInfo.
@@ -364,10 +373,10 @@ func targetFromProxiedURL(u, tokenPrefix, basePath string) *TargetInfo {
 	return ParseTarget(path, "")
 }
 
-func (s *Server) serveStaticJS(w http.ResponseWriter, r *http.Request, body []byte) {
+func (s *Server) serveStaticJS(w http.ResponseWriter, r *http.Request, body []byte, allowedScope string) {
 	w.Header().Set("Content-Type", "application/javascript; charset=UTF-8")
 	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Service-Worker-Allowed", "/")
+	w.Header().Set("Service-Worker-Allowed", allowedScope)
 	w.Header().Set("Content-Length", fmt.Sprint(len(body)))
 	_, _ = w.Write(body)
 }

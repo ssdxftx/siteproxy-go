@@ -4,6 +4,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"strings"
@@ -63,13 +64,17 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, target *Target
 		return
 	}
 
-	// Cookie header oversize guard (upstream behaviour): when the browser
-	// sends more than 4000 bytes of cookies the upstream would reject the
-	// request anyway, so answer 431 immediately and expire up to two
-	// non-control cookies to shrink the header (v2.7.x self-healing).
-	if ck := r.Header.Get("Cookie"); len(ck) > maxCookieHeaderBytes {
-		p.serveCookieTooLarge(w, r, ck, target)
-		return
+	// Cookie header oversize guard (upstream behaviour): the limit applies
+	// to the cookies actually forwarded, so the proxy's own control cookies
+	// (Path=/, stripped below) never count toward it. When the remaining
+	// header is still too large the upstream would reject the request
+	// anyway, so answer 431 immediately and expire up to two non-control
+	// cookies to shrink it (v2.7.x self-healing).
+	if ck := r.Header.Get("Cookie"); ck != "" {
+		if len(filterControlCookies(ck)) > maxCookieHeaderBytes {
+			p.serveCookieTooLarge(w, r, ck, target)
+			return
+		}
 	}
 
 	// WebSocket upgrade: hijack and pipe both directions.
@@ -89,7 +94,10 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, target *Target
 
 	resp, err := p.client.Do(upReq)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("Proxy fetch error: %v", err), http.StatusBadGateway)
+		// Never echo the underlying error: it contains the upstream host/port
+		// and would leak the real target to the client (upstream parity).
+		log.Printf("[siteproxy] proxy fetch error for %s: %v", target.Host, err)
+		http.Error(w, "Proxy fetch error", http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
@@ -249,14 +257,16 @@ func (p *Proxy) buildUpstreamRequest(r *http.Request, target *TargetInfo) (*http
 func (p *Proxy) writeResponse(w http.ResponseWriter, r *http.Request, resp *http.Response, target *TargetInfo) {
 	outHeader := w.Header()
 	needsProcess := bodyNeedsProcess(resp)
+	isRedirect := resp.StatusCode >= 300 && resp.StatusCode < 400
 
 	// Decompress on the fly before rewriting. When the encoding cannot be
 	// decoded here (zstd, corrupt stream, unknown coding), the body must be
 	// forwarded VERBATIM with its Content-Encoding intact - stripping the
 	// header would make the browser render undecodable bytes (the upstream
 	// relies on the same rule: only encodings it can decode are consumed).
+	// Redirect bodies are discarded, so there is nothing to decode.
 	body := resp.Body
-	if needsProcess {
+	if needsProcess && !isRedirect {
 		if enc := resp.Header.Get("Content-Encoding"); enc != "" && !strings.EqualFold(enc, "identity") {
 			if dec, ok := newDecoder(enc, body); ok {
 				body = io.NopCloser(dec)
@@ -286,23 +296,34 @@ func (p *Proxy) writeResponse(w http.ResponseWriter, r *http.Request, resp *http
 		return
 	}
 
+	// Redirects never forward a body (upstream parity): only the status,
+	// Location and representation headers reach the browser. Content-Type
+	// stays as the origin sent it (304 is exempt from the text/plain
+	// fallback applied to untyped bodies).
+	if isRedirect {
+		outHeader.Del("Content-Length")
+		w.WriteHeader(resp.StatusCode)
+		return
+	}
+
 	flusher, canFlush := w.(http.Flusher)
 
-	// Non-processed bodies stream verbatim (binary/video/zip/SSE/3xx...).
+	// Non-processed bodies stream verbatim (binary/video/zip/SSE...).
 	if !needsProcess {
-		// Redirects: the upstream answers with a small text body.
-		if resp.StatusCode >= 300 && resp.StatusCode < 400 {
-			outHeader.Set("Content-Type", "text/plain; charset=UTF-8")
-		}
 		w.WriteHeader(resp.StatusCode)
 		if canFlush {
 			flusher.Flush()
 		}
-		buf := make([]byte, 64*1024)
-		_, _ = io.CopyBuffer(w, body, buf)
+		// Flush after every chunk: SSE / streaming responses must reach the
+		// browser as the upstream produces them, not after the whole body has
+		// been buffered (upstream parity; the previous io.CopyBuffer only
+		// flushed once at EOF).
+		buf := make([]byte, 32*1024)
+		var dst io.Writer = w
 		if canFlush {
-			flusher.Flush()
+			dst = flushWriter{w: w, f: flusher}
 		}
+		_, _ = io.CopyBuffer(dst, body, buf)
 		return
 	}
 
@@ -333,6 +354,23 @@ func (p *Proxy) writeResponse(w http.ResponseWriter, r *http.Request, resp *http
 		// data buffered, so stream the remainder after the already-read part.
 		outHeader.Del("Content-Encoding")
 		outHeader.Del("Content-Length")
+		if strings.HasPrefix(ct, "text/html") {
+			// The bytes are not transcoded, so advertise the charset the
+			// browser will actually use. Upstream gives the in-document meta
+			// priority over the header; keeping a wrong header (e.g. UTF-8 on
+			// a GBK page) would render the whole oversized page as mojibake.
+			cs, isUTF16 := htmlBodyCharset(out, resp.Header.Get("Content-Type"))
+			if cs == "" || isUTF8(cs) {
+				cs = "UTF-8"
+			}
+			outHeader.Set("Content-Type", "text/html; charset="+cs)
+			// Inject the client runtime when the encoding is ASCII-compatible
+			// (the tag is pure ASCII, so GBK/Big5 bytes are untouched).
+			// UTF-16 bodies cannot carry an ASCII snippet.
+			if !isUTF16 {
+				out = injectSnippetBytes(out, injectedScriptTagAt(p.cfg.BasePath()))
+			}
+		}
 		w.WriteHeader(resp.StatusCode)
 		_, _ = w.Write(out)
 		_, _ = io.Copy(w, body)
@@ -351,6 +389,21 @@ func (p *Proxy) writeResponse(w http.ResponseWriter, r *http.Request, resp *http
 	_, _ = w.Write(out)
 }
 
+// flushWriter flushes the underlying http.Flusher after every successful
+// write, so streamed chunks are delivered immediately.
+type flushWriter struct {
+	w io.Writer
+	f http.Flusher
+}
+
+func (fw flushWriter) Write(p []byte) (int, error) {
+	n, err := fw.w.Write(p)
+	if n > 0 && fw.f != nil {
+		fw.f.Flush()
+	}
+	return n, err
+}
+
 // publicPrefix is "{proxy_url}{token_prefix}", the absolute prefix every
 // rewritten URL is built with (same shape as the original siteproxy).
 func (p *Proxy) publicPrefix() string { return p.cfg.ProxyURL + p.cfg.TokenPrefix }
@@ -366,7 +419,7 @@ func (p *Proxy) renderHTML(resp *http.Response, body io.Reader, target *TargetIn
 	}
 	html, _ := decodeHTMLBody(raw, resp.Header.Get("Content-Type"))
 	base := p.cfg.ProxyURL + p.cfg.TokenPrefix + target.SitePrefix() + target.Path
-	inject := renderInlineBootstrap(p.cfg, target.Protocol, target.Host) + injectedScriptTag
+	inject := renderInlineBootstrap(p.cfg, target.Protocol, target.Host) + injectedScriptTagAt(p.cfg.BasePath())
 	return []byte(rewriteHTML(html, p.publicPrefix(), base, p.proxyHost(), inject)), false
 }
 
@@ -431,8 +484,8 @@ func contentType(ct string) string {
 // a missing content-type to text/plain (never rewritten), and rewriting an
 // unknown binary payload as JS would corrupt it.
 func bodyNeedsProcess(resp *http.Response) bool {
-	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
-		return false // redirects carry no meaningful body
+	if resp.StatusCode == http.StatusNotModified {
+		return false // 304 carries no body; keep representation headers as-is
 	}
 	if resp.StatusCode >= 500 {
 		return false // upstream keeps error bodies verbatim (status < 500 rewrite)

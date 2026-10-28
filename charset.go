@@ -83,6 +83,37 @@ func decodeHTMLBody(raw []byte, contentTypeHeader string) (string, string) {
 	return string(raw), ""
 }
 
+// htmlBodyCharset reports the charset a browser will effectively use for raw
+// (untranscoded) HTML bytes. It follows the same priority as decodeHTMLBody:
+// BOM, in-document meta / xml declaration, then the Content-Type header. The
+// boolean reports a UTF-16 body, into which ASCII bytes cannot be injected.
+func htmlBodyCharset(raw []byte, contentTypeHeader string) (string, bool) {
+	switch {
+	case bytes.HasPrefix(raw, bomUTF16LE):
+		return "utf-16le", true
+	case bytes.HasPrefix(raw, bomUTF16BE):
+		return "utf-16be", true
+	case bytes.HasPrefix(raw, bomUTF8):
+		return "utf-8", false
+	}
+	window := raw
+	if len(window) > sniffWindowBytes {
+		window = window[:sniffWindowBytes]
+	}
+	if m := metaCharsetRe.FindSubmatch(window); m != nil {
+		cs := string(m[1])
+		return cs, utf16CharsetNames.MatchString(cs)
+	}
+	if m := xmlEncodingRe.FindSubmatch(window); m != nil {
+		cs := string(m[1])
+		return cs, utf16CharsetNames.MatchString(cs)
+	}
+	if cs := charsetFromContentType(contentTypeHeader); cs != "" {
+		return cs, utf16CharsetNames.MatchString(cs)
+	}
+	return "utf-8", false
+}
+
 // decodeTextBody transcodes a plain-text (CSS/JS) body to UTF-8 using the
 // declared header charset only (meta sniffing does not apply).
 func decodeTextBody(raw []byte, contentTypeHeader string) ([]byte, string) {
