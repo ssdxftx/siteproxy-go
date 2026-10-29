@@ -151,11 +151,11 @@ func decodeBytes(raw []byte, cs string) (string, string) {
 
 	enc, err := htmlindex.Get(cs)
 	if err != nil {
-		return string(raw), ""
+		return strings.ToValidUTF8(string(raw), "\uFFFD"), ""
 	}
 	out, err := enc.NewDecoder().Bytes(raw)
 	if err != nil {
-		return string(raw), ""
+		return strings.ToValidUTF8(string(raw), "\uFFFD"), ""
 	}
 	return string(out), cs
 }
@@ -182,7 +182,7 @@ func decodeUTF16(raw []byte, cs string) (string, string) {
 	}
 	out, err := enc.NewDecoder().Bytes(raw)
 	if err != nil {
-		return string(raw), ""
+		return strings.ToValidUTF8(string(raw), "\uFFFD"), ""
 	}
 	return string(out), name
 }

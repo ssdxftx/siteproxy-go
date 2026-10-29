@@ -76,7 +76,8 @@ func TestSubpathInjectionAndServiceWorker(t *testing.T) {
 	if !strings.Contains(string(js), "(proxyBasePath || '') + '/siteproxy_service_worker.js") {
 		t.Errorf("service worker URL is not base-path aware")
 	}
-	if !strings.Contains(string(js), "{ scope: (proxyBasePath || '') + '/' }") {
+	if !strings.Contains(string(js), "var swScope = (proxyBasePath || '') + '/'") ||
+		!strings.Contains(string(js), "scope: swScope") {
 		t.Errorf("service worker scope is not base-path aware")
 	}
 

@@ -8,7 +8,7 @@ import (
 	"strings"
 )
 
-const defaultTokenPrefix = "/user22334455/"
+const defaultTokenPrefix = "/default/"
 
 // Config mirrors the original siteproxy config.json so that existing users
 // can switch to the Go binary without touching their configuration.
@@ -18,8 +18,8 @@ type Config struct {
 	ProxyURL string `json:"proxy_url"`
 
 	// TokenPrefix is the "password" embedded in every proxied URL, it must
-	// start and end with "/". An empty value uses the upstream default
-	// password; only an explicit "/" disables authentication.
+	// start and end with "/". An empty value uses the upstream default token
+	// "/default/"; an explicit "/" disables authentication (Go extension).
 	TokenPrefix string `json:"token_prefix"`
 
 	// LocalListenPort is the HTTP port this server listens on.
@@ -27,6 +27,10 @@ type Config struct {
 
 	// BlockedSites is a list of (sub)domains the proxy refuses to fetch.
 	BlockedSites []string `json:"blocked_sites"`
+
+	// CookieMaxAge caps every non-control Set-Cookie lifetime in seconds.
+	// 1800 matches upstream v2.7.11; 0 keeps the origin's original expiry.
+	CookieMaxAge int `json:"cookie_max_age_seconds"`
 
 	// Description is informational only, kept for config.json compatibility.
 	Description string `json:"description"`
@@ -44,6 +48,7 @@ func LoadConfig(path string) (*Config, error) {
 		ProxyURL:        "http://localhost:5006",
 		TokenPrefix:     defaultTokenPrefix,
 		LocalListenPort: 5006,
+		CookieMaxAge:    1800,
 	}
 
 	if data, err := os.ReadFile(path); err == nil {
@@ -65,6 +70,12 @@ func LoadConfig(path string) (*Config, error) {
 		var port int
 		if _, err := fmt.Sscanf(v, "%d", &port); err == nil && port > 0 {
 			cfg.LocalListenPort = port
+		}
+	}
+	if v := os.Getenv("SITEPROXY_COOKIE_MAX_AGE"); v != "" {
+		var age int
+		if _, err := fmt.Sscanf(v, "%d", &age); err == nil && age >= 0 {
+			cfg.CookieMaxAge = age
 		}
 	}
 	if v := os.Getenv("SITEPROXY_BLOCKED_SITES"); v != "" {
@@ -98,6 +109,9 @@ func (c *Config) normalize() (*Config, error) {
 	if c.LocalListenPort <= 0 {
 		c.LocalListenPort = 5006
 	}
+	if c.CookieMaxAge < 0 {
+		c.CookieMaxAge = 1800
+	}
 
 	blocked := make(map[string]bool, len(c.BlockedSites))
 	for _, s := range c.BlockedSites {
@@ -106,16 +120,8 @@ func (c *Config) normalize() (*Config, error) {
 			blocked[s] = true
 		}
 	}
-	// Built-in block list carried over from upstream siteproxy v2.7.11
-	// (default block_urls). Entries containing "/" match anywhere in the
-	// target URL; plain domain entries match the host or its subdomains.
-	for _, s := range []string{
-		"telegram.org/service_worker.js",
-		"elcomercio.pe",
-		"exchangebank.com",
-	} {
-		blocked[s] = true
-	}
+	// Blocking is opt-in through blocked_sites. Upstream node mode does not
+	// enforce this field, so there is no built-in list to merge here.
 	c.BlockedSites = nil
 	for s := range blocked {
 		c.BlockedSites = append(c.BlockedSites, s)
@@ -124,8 +130,8 @@ func (c *Config) normalize() (*Config, error) {
 }
 
 // normalizeTokenPrefix ensures the prefix starts and ends with "/".
-// An empty value falls back to the upstream default password; only an explicit
-// "/" disables authentication.
+// An empty value falls back to the upstream default token "/default/"; only an
+// explicit "/" disables authentication.
 func normalizeTokenPrefix(p string) string {
 	p = strings.TrimSpace(p)
 	if p == "" {

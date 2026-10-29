@@ -31,7 +31,7 @@ func TestNELHeaderStripped(t *testing.T) {
 	}
 }
 
-func TestBuiltinBlocklistMatchesUpstream(t *testing.T) {
+func TestBlocklistIsConfigOnly(t *testing.T) {
 	cfg, err := (&Config{
 		ProxyURL:        "http://localhost:5006",
 		TokenPrefix:     "/t/",
@@ -41,20 +41,24 @@ func TestBuiltinBlocklistMatchesUpstream(t *testing.T) {
 		t.Fatalf("normalize: %v", err)
 	}
 
-	// Upstream v2.7.11 blocks exactly these three entries.
-	for _, host := range []string{"www.visa.com.sg", "netsuite.com", "visa.com"} {
+	// Upstream node mode does not enforce a built-in block list, so the Go
+	// implementation must not block anything unless blocked_sites says so.
+	for _, host := range []string{"www.visa.com.sg", "netsuite.com", "visa.com",
+		"www.elcomercio.pe", "exchangebank.com"} {
 		if cfg.IsBlocked(host) {
-			t.Errorf("%s must not be blocked (not in upstream default list)", host)
+			t.Errorf("%s must not be blocked without an explicit entry", host)
 		}
 	}
-	if !cfg.IsBlocked("www.elcomercio.pe") {
-		t.Error("elcomercio.pe should be blocked")
+	if cfg.IsBlockedURL("https://telegram.org/service_worker.js") {
+		t.Error("telegram.org/service_worker.js must not be blocked without an explicit entry")
 	}
-	if !cfg.IsBlocked("exchangebank.com") {
-		t.Error("exchangebank.com should be blocked")
+
+	cfg.BlockedSites = []string{"elcomercio.pe", "telegram.org/service_worker.js"}
+	if !cfg.IsBlocked("www.elcomercio.pe") {
+		t.Error("explicit elcomercio.pe entry should block subdomains")
 	}
 	if !cfg.IsBlockedURL("https://telegram.org/service_worker.js") {
-		t.Error("telegram.org/service_worker.js should be blocked")
+		t.Error("explicit path entry should be matched")
 	}
 }
 

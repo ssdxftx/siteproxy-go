@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -57,6 +58,9 @@ func main() {
 	log.Printf("[siteproxy] IS_NODE: false, version: %s", version)
 	log.Printf("[siteproxy] Listening on http://localhost:%d", cfg.LocalListenPort)
 	log.Printf("[siteproxy] proxy_url=%s token_prefix=%s", cfg.ProxyURL, cfg.TokenPrefix)
+	if cfg.noPassword() {
+		log.Printf("[siteproxy] WARNING: token_prefix is \"/\" - authentication is DISABLED")
+	}
 
 	// Graceful shutdown on SIGINT/SIGTERM.
 	go waitSignal(httpSrv)
@@ -76,10 +80,17 @@ func waitSignal(srv *http.Server) {
 	_ = srv.Close()
 }
 
-// configPath returns the directory of the running executable, used to locate
-// config.json when the binary is started from another working directory.
+// configPath resolves the config file. Explicit relative paths are resolved
+// against the current working directory; only the default "config.json" falls
+// back to the executable directory when it is not present in the cwd.
 func configPath(name string) string {
 	if filepath.IsAbs(name) {
+		return name
+	}
+	if name != "config.json" || strings.ContainsAny(name, `/\\`) {
+		return name
+	}
+	if _, err := os.Stat(name); err == nil {
 		return name
 	}
 	exe, err := os.Executable()

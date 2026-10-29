@@ -20,16 +20,16 @@ user browser +--------------->+ siteproxy-go   +-------> wikipedia
 | 路径式反代 `{token}{proto}/{host}/{path}` | ✅ | ✅ 同样的 URL 格式 |
 | token_prefix 密码保护 | ✅ | ✅ |
 | HTML/CSS/JS 服务端 URL 重写（href/src/srcset/action/url()/@import） | ✅ | ✅ 含 v2.7.x 各项修复（srcset 逗号、style 内 url()、自引用防双包等） |
-| 客户端运行时（location / history / window.open / fetch / XHR / WebSocket / EventSource / sendBeacon 覆盖） | ✅ 混淆 | ✅ 明文重写，逻辑一致 |
+| 客户端运行时（location / history / window.open / fetch / XHR / sendBeacon 覆盖） | ✅ 混淆 | ✅ 明文重写；另额外覆盖 WebSocket / EventSource |
 | Service Worker（越界请求修复、404 重试、PROXY_CUR_LOCATION 同步） | ✅ 混淆 | ✅ 明文重写 |
-| Cookie 按站点隔离（v2.6.0，防 8K Cookie 502） | ✅ | ✅ Path 改写 + Domain 剥离 + document.cookie 拦截 + 控制 cookie 过滤 |
+| Cookie 按站点隔离（v2.6.0） | ✅ | ✅ Path 改写 + document.cookie 拦截 + 控制 cookie 过滤（Domain/Max-Age 策略见 FAQ） |
 | CSP / X-Frame-Options / COOP / COEP 剥离 | ✅ | ✅ |
 | GBK / GB18030 / Big5 / Shift-JIS / EUC-KR 自动转码为 UTF-8 | ✅ | ✅（含 meta 嗅探与 charset 注入） |
 | gzip / deflate / brotli 透明解码 | ➖ node 模式原样转发压缩体（不重写） | ✅ 解码后重写（与 CF worker 模式行为一致） |
 | 无引号 HTML 属性重写（如百度 `href=//...`） | ➖ | ✅ 额外支持 |
 | SSE / 流式响应（Duck.ai 对话依赖） | ✅ | ✅ 逐块 flush |
-| WebSocket 双向代理（Telegram Web 等） | ✅ | ✅ hijack + 双向管道 |
-| 被墙站点黑名单 | ✅ | ✅ 配置文件 / 环境变量 |
+| WebSocket 双向代理（Telegram Web 等） | ➖ node 模式不支持 | ✅ hijack + 双向管道 |
+| 被墙站点黑名单 | ➖ node 模式忽略 blocked_sites | ✅ 仅显式配置生效 |
 | 首页（solarized 明暗双主题） | ✅ | ✅ 原版移植 |
 | Duck.ai / 常用网站入口 | ✅ | ✅ 首页内置链接 |
 | 单文件部署 | ❌ 需 Node 22 | ✅ ~10MB 静态二进制 |
@@ -70,9 +70,10 @@ linux/amd64、linux/arm64、darwin/amd64、darwin/arm64、windows/amd64、freebs
 | 字段 | 说明 |
 |------|------|
 | `proxy_url` | 对外访问的完整地址（nginx 反代之后的公网 URL），用于生成代理链接、判断 HTTPS |
-| `token_prefix` | 访问密码，**首尾斜杠必须保留**；显式设为 `"/"` 表示免密码，空字符串回退到原版默认密码 `/user22334455/` |
+| `token_prefix` | 访问密码，**首尾斜杠必须保留**；空字符串回退到原版默认 token `/default/`，显式设为 `"/"` 表示免密码（Go 扩展，启动时会打印警告） |
 | `local_listen_port` | 监听端口（默认 5006，与原版/nginx 配置兼容） |
-| `blocked_sites` | 禁止代理的站点列表（自动附带 exchangebank.com / netsuite.com 等） |
+| `blocked_sites` | 禁止代理的站点列表；仅按此处显式配置生效，不内置任何域名 |
+| `cookie_max_age_seconds` | 非控制 Cookie 的生命周期上限，默认 `1800`（与原版一致）；设为 `0` 保留上游原始过期策略 |
 
 环境变量（优先级高于 config.json，便于容器部署）：
 
@@ -82,9 +83,13 @@ export SITEPROXY_PROXY_URL=https://proxy.example.com
 export SITEPROXY_TOKEN_PREFIX=/user-your-password/
 export SITEPROXY_LOCAL_LISTEN_PORT=5006
 export SITEPROXY_BLOCKED_SITES=a.com,b.com
+export SITEPROXY_COOKIE_MAX_AGE=1800
 
 # 仅调试自签名上游证书时设为 1，生产环境保持 0
 export SITEPROXY_INSECURE_SKIP_VERIFY=0
+
+# 默认不读取 HTTP_PROXY/HTTPS_PROXY；需要时显式开启
+export SITEPROXY_USE_ENV_PROXY=1
 ```
 
 ### 3. 本地运行
@@ -399,11 +404,10 @@ Go 版面向 VPS 部署（与原版 Node VPS 部署方式一致）。原版为�
 - **压缩响应**：node/Go 行为等价——node 依赖 undici 自动解压后重写，Go 自行解码 gzip/deflate/br 后重写；
   遇到双方都无法解码的编码（如 zstd）时，原版直接 500 崩溃，Go 版原样透传（保留 Content-Encoding，不重写）。
 - **空 Content-Type**：两版一致——均不重写、按二进制透传（node 默认按 text/plain 处理，Go 同样不注入）。
-- **空响应体**：两版一致——不注入、原样返回空体。
-- **cookie 生命周期**：原版给所有 Set-Cookie 统一追加 `Max-Age=1800`（30 分钟上限）并回填
-  `Domain=<代理主机>`；Go 版保留上游原始过期策略（站点会话不会被意外截断），Domain 一律剥离成 host-only。
-- **Secure / SameSite 归一**：原版原样保留 `Secure; SameSite=None`，在纯 HTTP 自部署下浏览器会拒收；
-  Go 版按部署协议归一（HTTP 下去掉 Secure、SameSite 改 Lax），HTTPS 部署下与原版等效。
+- **空响应体**：两版一致——不注入、保留上游 `Content-Type` 并返回空体。
+- **cookie 生命周期**：默认与原版一致，给非控制 Set-Cookie 统一追加 `Max-Age=1800`（30 分钟上限）；
+  可用 `cookie_max_age_seconds: 0` 保留上游原始过期策略。`Domain` 仍一律剥离成 host-only。
+- **Secure / SameSite 归一**：HTTPS 部署下原样保留 `Secure` 与 `SameSite=None/Strict`；纯 HTTP 部署下去掉 `Secure`，并仅把浏览器会拒收的 `SameSite=None` 改为 `Lax`。
 - **控制 cookie**：两版一致——仅在被重写的文本响应（html/js/css，status<500）上追加
   `proxy_real_protocol/host; Path=/; HttpOnly`，并在上游转发前过滤。
 - **X-Forwarded-For**：原版不向上游发送，Go 版同样不发送。
@@ -425,8 +429,9 @@ Go 版面向 VPS 部署（与原版 Node VPS 部署方式一致）。原版为�
 - **加固项（Go 版增强）**：handler panic 恢复中间件（单请求 502，不拖垮进程）；out-of-scope 修复路径
   对控制 cookie 中的主机做严格校验（防 cookie 投毒 / userinfo 走私）；客户端运行时增加
   Element.setAttribute 陷阱与 data-src 重写（与原版客户端对齐）。
-其余行为（URL 格式、HTML/JS/CSS 重写输出、注入脚本与内联引导脚本、cookie 路径隔离、
-431 超大 Cookie 自愈、out-of-scope 路径修复、CSP 剥离、转码等）已与原版 node 模式逐字节/逐头对齐。
+以下行为已与原版 node 模式对齐：URL 格式、常见 HTML/CSS/JS 重写、注入脚本与内联引导脚本、
+cookie 路径隔离、431 超大 Cookie 自愈、out-of-scope 路径修复、CSP 剥离、字符集转码、
+空响应体、`Location`/`Refresh`/`Set-Cookie`/`Link` 头处理。
 
 **Q: 如何修改首页网站列表？**
 编辑 `assets/index.html` 后重新 `make build`（资源以 go:embed 打包进二进制）。

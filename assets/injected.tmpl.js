@@ -60,7 +60,7 @@
   // token prefix from a pathname. It returns null when the path is not in
   // proxy scope, so real root-relative paths are never mistaken for one.
   function stripProxyPrefixPath(path) {
-    if (proxyBasePath && path.indexOf(proxyBasePath) === 0) {
+    if (proxyBasePath && (path === proxyBasePath || path.indexOf(proxyBasePath + '/') === 0)) {
       path = path.substring(proxyBasePath.length);
     }
     if (token_prefix === '/') {
@@ -741,19 +741,64 @@
       return;
     }
     if (!proxy_real_host) return; // homepage: no target site context yet
+    var swScope = (proxyBasePath || '') + '/';
     var swURL = (proxyBasePath || '') + '/siteproxy_service_worker.js?proxy_real_protocol=' +
       encodeURIComponent(proxy_real_protocol) + '&proxy_real_host=' +
       encodeURIComponent(proxy_real_host) + '&v=4';
-    realSW.register(swURL, { scope: (proxyBasePath || '') + '/' }).catch(function (err) {
-      console.warn('[siteproxy] service worker registration failed:', err);
-    });
+
+    function adoptRegistration(reg) {
+      if (!reg) return;
+      window.proxy_worker_registration = reg;
+      try {
+        var target = reg.active || realSW.controller;
+        if (target) {
+          target.postMessage({
+            type: 'PROXY_CUR_LOCATION',
+            data: { protocol: proxy_real_protocol, host: proxy_real_host }
+          });
+        }
+      } catch (e) { /* ignore */ }
+      try { reg.update(); } catch (e) { /* ignore */ }
+    }
+
+    function registerSW() {
+      realSW.register(swURL, { scope: swScope }).then(adoptRegistration).catch(function (err) {
+        console.warn('[siteproxy] service worker registration failed:', err);
+      });
+    }
+
+    // Reuse an already active registration instead of registering again;
+    // this mirrors upstream and lets the page get its context immediately
+    // even when the worker is not controlling the page yet.
+    if (typeof realSW.getRegistrations === 'function') {
+      realSW.getRegistrations().then(function (regs) {
+        for (var i = 0; i < regs.length; i++) {
+          var reg = regs[i];
+          if (reg.active && reg.active.scriptURL &&
+              reg.active.scriptURL.indexOf('siteproxy_service_worker.js') !== -1) {
+            adoptRegistration(reg);
+            return;
+          }
+        }
+        registerSW();
+      }).catch(registerSW);
+    } else {
+      registerSW();
+    }
+    try {
+      realSW.addEventListener('controllerchange', function () {
+        adoptRegistration(window.proxy_worker_registration);
+      });
+    } catch (e) { /* ignore */ }
   })();
 
   function notifyServiceWorker() {
     try {
       var sw = window.___siteproxyRealSW;
-      if (sw && sw.controller) {
-        sw.controller.postMessage({
+      var target = (sw && sw.controller) ||
+        (window.proxy_worker_registration && window.proxy_worker_registration.active);
+      if (target) {
+        target.postMessage({
           type: 'PROXY_CUR_LOCATION',
           data: { protocol: proxy_real_protocol, host: proxy_real_host }
         });
@@ -762,6 +807,7 @@
   }
   notifyServiceWorker();
   window.addEventListener('popstate', refreshCurrentLocation);
+  window.addEventListener('hashchange', refreshCurrentLocation);
 
   // ------------------------------------------------------------------
   // 9. Runtime DOM rewriting (belt & braces with the server rewriter).
@@ -809,13 +855,46 @@
         var cssText = rewriteCSSUrls(el.textContent);
         if (cssText !== el.textContent) el.textContent = cssText;
       }
+      if (tag === 'IFRAME' && !el.__siteproxy_iframe_hooked) {
+        el.__siteproxy_iframe_hooked = true;
+        var hookIframe = function () {
+          try {
+            var d = el.contentDocument;
+            if (!d || d.__siteproxy_traversed) return;
+            d.__siteproxy_traversed = true;
+            traverse(d);
+            if (d.documentElement && window.MutationObserver) {
+              new MutationObserver(function (muts) {
+                for (var i = 0; i < muts.length; i++) {
+                  var added = muts[i].addedNodes;
+                  for (var j = 0; j < added.length; j++) {
+                    var n = added[j];
+                    if (n.nodeType !== 1) continue;
+                    rewriteElement(n);
+                    if (n.querySelectorAll) traverse(n);
+                  }
+                  if (muts[i].type === 'attributes') rewriteElement(muts[i].target, true);
+                }
+              }).observe(d.documentElement, {
+                childList: true, subtree: true, attributes: true,
+                attributeFilter: ['href', 'src', 'action', 'formaction', 'srcset', 'imagesrcset',
+                  'poster', 'cite', 'manifest', 'data', 'dynsrc', 'lowsrc',
+                  'data-url', 'data-src', 'data-href', 'data-background', 'data-original',
+                  'integrity', 'crossorigin', 'style']
+              });
+            }
+          } catch (e) { /* cross-origin iframe */ }
+        };
+        el.addEventListener('load', hookIframe);
+        hookIframe();
+      }
     } catch (e) { /* ignore single-node failures */ }
   }
 
   function rewriteCSSUrls(css) {
     // Handles normal quotes and the HTML-entity quotes some sites emit
     // inside url(...), matching the server-side splitCSSURLQuotes logic.
-    return css.replace(/url\(\s*([^)]*?)\s*\)/gi, function (m, inner) {
+    var rewritten = css.replace(/url\(\s*([^)]*?)\s*\)/gi, function (m, inner) {
       var quote = '';
       var u = inner;
       var lower = inner.toLowerCase();
@@ -841,7 +920,29 @@
       if (!u || /^(data:|blob:|#)/i.test(u)) return m;
       if (!quote && /\s/.test(u)) return m;
       return 'url(' + quote + proxyRewrite(u) + quote + ')';
-    }).replace(/(["'])((?:https?:\/\/|\/\/|\/)[^"'\s]*)["']/gi, function (m, quote, u) {
+    });
+    return rewriteQuotedOutsideURLs(rewritten);
+  }
+
+  // Rewrites quoted URLs that are not inside url(...). Running the generic
+  // pass over url(...) a second time corrupts data: URIs that embed a quoted
+  // URL (e.g. inline SVG xmlns="http://www.w3.org/2000/svg").
+  function rewriteQuotedOutsideURLs(css) {
+    var re = /url\(\s*([^)]*?)\s*\)/gi;
+    var out = '';
+    var last = 0;
+    var m;
+    while ((m = re.exec(css)) !== null) {
+      out += rewriteQuotedSegment(css.slice(last, m.index));
+      out += m[0];
+      last = re.lastIndex;
+    }
+    out += rewriteQuotedSegment(css.slice(last));
+    return out;
+  }
+
+  function rewriteQuotedSegment(seg) {
+    return seg.replace(/(["'])((?:https?:\/\/|\/\/|\/)[^"'\s]*)["']/gi, function (m, quote, u) {
       // Quoted URLs outside url(), e.g. image-set("... 1x").
       return quote + proxyRewrite(u) + quote;
     });
@@ -939,6 +1040,18 @@
           enumerable: inner.enumerable
         });
       }
+      var outer = Object.getOwnPropertyDescriptor(Element.prototype, 'outerHTML');
+      if (outer && outer.set) {
+        Object.defineProperty(Element.prototype, 'outerHTML', {
+          get: outer.get,
+          set: function (v) {
+            outer.set.call(this, v);
+            if (this.parentNode) traverse(this.parentNode);
+          },
+          configurable: true,
+          enumerable: outer.enumerable
+        });
+      }
       var insert = Element.prototype.insertAdjacentHTML;
       if (insert) {
         Element.prototype.insertAdjacentHTML = function (pos, html) {
@@ -955,6 +1068,18 @@
           traverse(node);
           return node;
         };
+      }
+      if (typeof window.Image === 'function') {
+        var OriginalImage = window.Image;
+        function SiteProxyImage() {
+          if (typeof Reflect !== 'undefined' && Reflect.construct) {
+            return Reflect.construct(OriginalImage, arguments, SiteProxyImage);
+          }
+          return new OriginalImage(arguments[0], arguments[1]);
+        }
+        SiteProxyImage.prototype = OriginalImage.prototype;
+        try { Object.defineProperty(SiteProxyImage, 'name', { value: 'Image' }); } catch (e) { /* ignore */ }
+        window.Image = SiteProxyImage;
       }
     } catch (e) { /* ignore */ }
   })();
@@ -1009,6 +1134,35 @@
       }
     } catch (e) { /* ignore */ }
   }, true);
+
+  // GitHub form hook (upstream behaviour): GitHub login forms need the
+  // request to go through fetch so the proxy's referer/header handling is
+  // preserved, then the page follows the final response URL.
+  (function () {
+    try {
+      var pathname = window.___location && window.___location.pathname;
+      if (!pathname || pathname.indexOf('github.com') === -1) return;
+      if (window.__siteproxy_github_form_hooked) return;
+      window.__siteproxy_github_form_hooked = true;
+      setTimeout(function () {
+        var form = document.querySelector('form');
+        if (!form) return;
+        form.addEventListener('submit', function (ev) {
+          try {
+            ev.preventDefault();
+            var action = ev.target.action;
+            var method = ev.target.method || 'POST';
+            var data = new FormData(ev.target);
+            fetch(action, { method: method, body: data }).then(function (resp) {
+              window.location.href = resp.url;
+            }).catch(function (err) {
+              console.error('Error in form submission fetch', err);
+            });
+          } catch (e) { /* ignore */ }
+        });
+      }, 4000);
+    } catch (e) { /* ignore */ }
+  })();
 
   // Element.setAttribute trap (upstream behaviour): URL attributes and srcset
   // candidates are rewritten SYNCHRONOUSLY at set time, so an <img>.src or
@@ -1077,6 +1231,7 @@
   })();
 
   // Expose minimal internals for debugging.
+  window.siteproxyRegReplacement = function (u) { return proxyRewrite(u); };
   window.___siteproxy = {
     proxyRewrite: proxyRewrite,
     unRewriteURL: unRewriteURL,

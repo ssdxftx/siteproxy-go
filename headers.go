@@ -3,7 +3,9 @@ package main
 import (
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
+	"time"
 )
 
 // Headers that must never cross to the other side of the proxy.
@@ -126,7 +128,7 @@ func rewriteResponseHeaders(cfg *Config, resp *http.Response, out http.Header, t
 			continue
 		}
 		switch strings.ToLower(name) {
-		case "location", "refresh", "set-cookie":
+		case "location", "refresh", "set-cookie", "link":
 			continue // handled below
 		}
 		for _, v := range vals {
@@ -146,6 +148,11 @@ func rewriteResponseHeaders(cfg *Config, resp *http.Response, out http.Header, t
 	}
 	if ref := resp.Header.Get("Refresh"); ref != "" {
 		out.Set("Refresh", rewriteRefreshHeader(ref, publicPrefix, sitePrefix, hostOfURL(cfg.ProxyURL)))
+	}
+	// Link: <https://origin/a>; rel=preload must not make the browser fetch
+	// the real origin directly. Rewrite every <...> URL into proxy space.
+	for _, link := range resp.Header.Values("Link") {
+		out.Add("Link", rewriteLinkHeader(link, publicPrefix, sitePrefix, hostOfURL(cfg.ProxyURL)))
 	}
 
 	// Set-Cookie: isolate per site by rewriting Path and dropping Domain.
@@ -191,7 +198,35 @@ func rewriteRedirect(loc, publicPrefix, sitePrefix, proxyHost string) string {
 	}
 }
 
-var refreshURLRe = regexp.MustCompile(`(?i)^(.*?url\s*=\s*)(.+)$`)
+var (
+	refreshURLRe = regexp.MustCompile(`(?i)^(.*?url\s*=\s*)(.+)$`)
+	linkURLRe    = regexp.MustCompile(`<([^>]+)>`)
+)
+
+// rewriteLinkHeader rewrites the <...> URLs of a Link response header.
+func rewriteLinkHeader(v, publicPrefix, sitePrefix, proxyHost string) string {
+	return linkURLRe.ReplaceAllStringFunc(v, func(m string) string {
+		g := linkURLRe.FindStringSubmatch(m)
+		return "<" + rewriteLinkURL(g[1], publicPrefix, sitePrefix, proxyHost) + ">"
+	})
+}
+
+func rewriteLinkURL(u, publicPrefix, sitePrefix, proxyHost string) string {
+	lower := strings.ToLower(u)
+	switch {
+	case strings.HasPrefix(lower, "https://"), strings.HasPrefix(lower, "http://"):
+		return RewriteURL(u, publicPrefix, proxyHost)
+	case strings.HasPrefix(u, "//"):
+		if proxyHost != "" && strings.EqualFold(hostOfURL("https:"+u), proxyHost) {
+			return u
+		}
+		return publicPrefix + "https/" + u[2:]
+	case strings.HasPrefix(u, "/"):
+		return publicPrefix + sitePrefix + u
+	default:
+		return u
+	}
+}
 
 // rewriteRefreshHeader rewrites the URL inside a "Refresh: 2; url=/path".
 func rewriteRefreshHeader(ref, publicPrefix, sitePrefix, proxyHost string) string {
@@ -260,6 +295,14 @@ func rewriteSetCookie(sc, token, sitePrefix string, cfg *Config) string {
 	if kv == "" || kv == "=" || !strings.Contains(kv, "=") {
 		return ""
 	}
+	name := kv
+	if i := strings.IndexByte(kv, '='); i >= 0 {
+		name = kv[:i]
+	}
+	isControl := name == "proxy_real_host" || name == "proxy_real_protocol"
+	capLifetime := cfg.CookieMaxAge > 0 && !isControl
+	hasPastExpires := false
+	hasDeleteMaxAge := false
 
 	// Extract attributes, dropping/rewriting the isolation-relevant ones.
 	// Attribute names are parsed with optional whitespace around '=' (e.g.
@@ -280,6 +323,25 @@ func rewriteSetCookie(sc, token, sitePrefix string, cfg *Config) string {
 		switch strings.ToLower(name) {
 		case "domain":
 			// drop: cookies become host-only on the proxy domain
+		case "max-age":
+			n, err := strconv.Atoi(val)
+			if err == nil && n <= 0 {
+				hasDeleteMaxAge = true
+			}
+			if capLifetime && !(err == nil && n <= 0) {
+				continue // replace a positive/malformed Max-Age with the cap
+			}
+			attrs = append(attrs, p)
+		case "expires":
+			if capLifetime {
+				if t, err := http.ParseTime(val); err == nil {
+					if !t.Before(time.Now()) {
+						continue // replace future expiry with the cap
+					}
+					hasPastExpires = true
+				}
+			}
+			attrs = append(attrs, p)
 		case "path":
 			if val != "" {
 				origPath = val
@@ -289,7 +351,14 @@ func rewriteSetCookie(sc, token, sitePrefix string, cfg *Config) string {
 				attrs = append(attrs, "Secure")
 			}
 		case "samesite":
-			attrs = append(attrs, "SameSite=Lax")
+			// HTTPS deployments can keep None/Strict unchanged. On a plain
+			// HTTP proxy, SameSite=None is rejected by browsers without
+			// Secure, so normalise only that case to Lax.
+			if proxyIsHTTPS(cfg) || !strings.EqualFold(val, "none") {
+				attrs = append(attrs, p)
+			} else {
+				attrs = append(attrs, "SameSite=Lax")
+			}
 		default:
 			attrs = append(attrs, p)
 		}
@@ -318,6 +387,9 @@ func rewriteSetCookie(sc, token, sitePrefix string, cfg *Config) string {
 	out := kv + "; Path=" + outPath
 	for _, a := range attrs {
 		out += "; " + a
+	}
+	if capLifetime && !hasPastExpires && !hasDeleteMaxAge {
+		out += "; Max-Age=" + strconv.Itoa(cfg.CookieMaxAge)
 	}
 	return out
 }

@@ -96,6 +96,15 @@ func (p *panicRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.EscapedPath()
 
+	// A proxy mounted under a base path (proxy_url = https://host/sub) only
+	// serves URLs inside that prefix. Without this guard the same proxy is
+	// reachable both as /sub/{token}/... and /{token}/..., which breaks path
+	// isolation and generated-link consistency.
+	if bp := s.cfg.BasePath(); bp != "" && path != "/" && path != bp && !strings.HasPrefix(path, bp+"/") {
+		s.serveHomepage(w, r)
+		return
+	}
+
 	switch path {
 	case "/", "/index.html", "/index.htm":
 		s.serveHomepage(w, r)
@@ -183,6 +192,11 @@ func (s *Server) repairOutOfScope(r *http.Request) *TargetInfo {
 	}
 	if !strings.HasPrefix(path, "/") {
 		path = "/" + path
+	}
+	if bp := s.cfg.BasePath(); bp != "" {
+		if path != bp && !strings.HasPrefix(path, bp+"/") {
+			return nil
+		}
 	}
 	if bp := s.cfg.BasePath(); bp != "" && (path == bp || strings.HasPrefix(path, bp+"/")) {
 		path = strings.TrimPrefix(path, bp)

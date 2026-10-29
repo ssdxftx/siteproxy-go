@@ -2,10 +2,10 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"compress/flate"
 	"compress/gzip"
 	"io"
+	"strings"
 
 	"github.com/andybalholm/brotli"
 )
@@ -34,12 +34,35 @@ func newDecoder(encoding string, r io.Reader) (io.Reader, bool) {
 	return nil, false
 }
 
-func normalizeEncoding(e string) string {
-	// Content-Encoding may list multiple codings ("gzip, br") though rare.
-	if i := bytes.IndexByte([]byte(e), ','); i >= 0 {
-		e = e[:i]
+// newDecoderChain applies every coding in a Content-Encoding list in reverse
+// order. HTTP codings are listed in the order they were applied, so decoding
+// must start with the last one ("br, gzip" -> ungzip, then unbrotli).
+func newDecoderChain(encoding string, r io.Reader) (io.Reader, bool) {
+	parts := strings.Split(encoding, ",")
+	encs := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" || strings.EqualFold(p, "identity") {
+			continue
+		}
+		encs = append(encs, p)
 	}
-	switch e {
+	if len(encs) == 0 {
+		return r, true
+	}
+	body := r
+	for i := len(encs) - 1; i >= 0; i-- {
+		dec, ok := newDecoder(encs[i], body)
+		if !ok {
+			return nil, false
+		}
+		body = dec
+	}
+	return body, true
+}
+
+func normalizeEncoding(e string) string {
+	switch strings.ToLower(strings.TrimSpace(e)) {
 	case "gzip", "x-gzip":
 		return "gzip"
 	case "deflate":

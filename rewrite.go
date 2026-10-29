@@ -66,7 +66,7 @@ var (
 
 	integrityAttrRe = regexp.MustCompile(`(?i)\s(?:integrity|crossorigin)(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+))?`)
 
-	metaRefreshContentRe = regexp.MustCompile(`(?i)(\d*\s*;\s*url\s*=\s*)(["']?)([^"'>\s]+)`)
+	metaRefreshContentRe = regexp.MustCompile(`(?i)(\d*\s*;\s*url\s*=\s*)(?:(")([^"]*)(")|(')([^']*)(')|([^"'>\s]+))`)
 
 	injectAfterHeadRe = regexp.MustCompile(`(?i)<head[^>]*>`)
 	injectAfterBodyRe = regexp.MustCompile(`(?i)<body[^>]*>`)
@@ -267,8 +267,15 @@ func rewriteMetaRefresh(html, publicPrefix, baseProxiedURL, proxyHost string) st
 		}
 		return metaRefreshContentRe.ReplaceAllStringFunc(m, func(cm string) string {
 			g := metaRefreshContentRe.FindStringSubmatch(cm)
-			prefix, quote, u := g[1], g[2], g[3]
-			return prefix + quote + RewriteWithBase(u, publicPrefix, baseProxiedURL, proxyHost) + quote
+			prefix := g[1]
+			switch {
+			case g[2] != "":
+				return prefix + g[2] + RewriteWithBase(g[3], publicPrefix, baseProxiedURL, proxyHost) + g[2]
+			case g[5] != "":
+				return prefix + g[5] + RewriteWithBase(g[6], publicPrefix, baseProxiedURL, proxyHost) + g[5]
+			default:
+				return prefix + RewriteWithBase(g[8], publicPrefix, baseProxiedURL, proxyHost)
+			}
 		})
 	})
 }
@@ -406,11 +413,31 @@ func rewriteCSS(css, publicPrefix, baseProxiedURL, proxyHost string) string {
 		g := cssImportRe.FindStringSubmatch(m)
 		return g[1] + g[2] + RewriteWithBase(g[3], publicPrefix, baseProxiedURL, proxyHost) + g[4]
 	})
-	css = cssQuotedURLRe.ReplaceAllStringFunc(css, func(m string) string {
+	css = rewriteCSSQuotedURLs(css, publicPrefix, baseProxiedURL, proxyHost)
+	return css
+}
+
+// rewriteCSSQuotedURLs rewrites quoted URLs outside url(...) blocks. Quoted
+// URLs inside url(...) were already handled by the url() pass; running the
+// generic pass over them a second time corrupts data: URIs that embed a
+// quoted URL (e.g. inline SVG xmlns="http://www.w3.org/2000/svg").
+func rewriteCSSQuotedURLs(css, publicPrefix, baseProxiedURL, proxyHost string) string {
+	var out strings.Builder
+	last := 0
+	for _, loc := range cssURLRe.FindAllStringIndex(css, -1) {
+		out.WriteString(rewriteCSSQuotedSegment(css[last:loc[0]], publicPrefix, baseProxiedURL, proxyHost))
+		out.WriteString(css[loc[0]:loc[1]])
+		last = loc[1]
+	}
+	out.WriteString(rewriteCSSQuotedSegment(css[last:], publicPrefix, baseProxiedURL, proxyHost))
+	return out.String()
+}
+
+func rewriteCSSQuotedSegment(seg, publicPrefix, baseProxiedURL, proxyHost string) string {
+	return cssQuotedURLRe.ReplaceAllStringFunc(seg, func(m string) string {
 		g := cssQuotedURLRe.FindStringSubmatch(m)
 		return g[1] + RewriteWithBase(g[2], publicPrefix, baseProxiedURL, proxyHost) + g[1]
 	})
-	return css
 }
 
 // ----------------------------------------------------------------------------

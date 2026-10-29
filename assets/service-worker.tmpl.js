@@ -68,7 +68,7 @@ self.addEventListener('message', (event) => {
 // Returns null when the path is not inside the proxy scope.
 function pathInScope(pathname) {
   let p = pathname;
-  if (PROXY_BASE_PATH && p.startsWith(PROXY_BASE_PATH)) p = p.substring(PROXY_BASE_PATH.length);
+  if (PROXY_BASE_PATH && (p === PROXY_BASE_PATH || p.startsWith(PROXY_BASE_PATH + '/'))) p = p.substring(PROXY_BASE_PATH.length);
   if (TOKEN_PREFIX === '/') return true;
   return p.startsWith(TOKEN_PREFIX);
 }

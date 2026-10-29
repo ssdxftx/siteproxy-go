@@ -39,7 +39,7 @@ func NewProxy(cfg *Config, client *http.Client) (*Proxy, error) {
 func newHTTPClient() *http.Client {
 	dialer := &net.Dialer{Timeout: 15 * time.Second, KeepAlive: 60 * time.Second}
 	transport := &http.Transport{
-		Proxy:                 http.ProxyFromEnvironment,
+		Proxy:                 nil, // opt-in via SITEPROXY_USE_ENV_PROXY
 		DialContext:           dialer.DialContext,
 		ForceAttemptHTTP2:     true,
 		DisableCompression:    true,
@@ -50,6 +50,9 @@ func newHTTPClient() *http.Client {
 		ExpectContinueTimeout: 1 * time.Second,
 		ResponseHeaderTimeout: 60 * time.Second,
 		TLSClientConfig:       &tls.Config{InsecureSkipVerify: insecureSkipVerify()},
+	}
+	if useEnvProxy() {
+		transport.Proxy = http.ProxyFromEnvironment
 	}
 	return &http.Client{
 		Transport:     transport,
@@ -268,7 +271,7 @@ func (p *Proxy) writeResponse(w http.ResponseWriter, r *http.Request, resp *http
 	body := resp.Body
 	if needsProcess && !isRedirect {
 		if enc := resp.Header.Get("Content-Encoding"); enc != "" && !strings.EqualFold(enc, "identity") {
-			if dec, ok := newDecoder(enc, body); ok {
+			if dec, ok := newDecoderChain(enc, body); ok {
 				body = io.NopCloser(dec)
 			} else {
 				needsProcess = false
@@ -283,7 +286,7 @@ func (p *Proxy) writeResponse(w http.ResponseWriter, r *http.Request, resp *http
 	// scripts have not set their own copies yet. The upstream appends
 	// them ONLY for text bodies it actually rewrites (html/js/css with
 	// status < 500) - matching that keeps Cookie headers small.
-	if target != nil && needsProcess {
+	if target != nil && needsProcess && r.Method != http.MethodHead {
 		outHeader.Add("Set-Cookie",
 			"proxy_real_protocol="+target.Protocol+"; Path=/; HttpOnly")
 		outHeader.Add("Set-Cookie",
@@ -323,28 +326,40 @@ func (p *Proxy) writeResponse(w http.ResponseWriter, r *http.Request, resp *http
 		if canFlush {
 			dst = flushWriter{w: w, f: flusher}
 		}
-		_, _ = io.CopyBuffer(dst, body, buf)
+		if _, err := io.CopyBuffer(dst, body, buf); err != nil {
+			log.Printf("[siteproxy] stream upstream body for %s: %v", target.Host, err)
+		}
 		return
 	}
 
 	ct := contentType(resp.Header.Get("Content-Type"))
 	var out []byte
 	var truncated bool
+	var renderErr error
 	switch {
 	case strings.HasPrefix(ct, "text/html"):
-		out, truncated = p.renderHTML(resp, body, target)
-		if !truncated {
+		out, truncated, renderErr = p.renderHTML(resp, body, target)
+	case strings.HasPrefix(ct, "text/css"):
+		out, truncated, renderErr = p.renderCSS(resp, body, target)
+	default: // javascript and anything else text-ish
+		out, truncated, renderErr = p.renderJS(resp, body, target)
+	}
+	if renderErr != nil {
+		// The upstream body could not be read completely. Do not turn a
+		// broken transfer into a successful 200 with a partial page.
+		log.Printf("[siteproxy] read upstream body for %s: %v", target.Host, renderErr)
+		clearResponseHeader(outHeader)
+		http.Error(w, "Proxy fetch error", http.StatusBadGateway)
+		return
+	}
+	if !truncated {
+		switch {
+		case strings.HasPrefix(ct, "text/html"):
 			outHeader.Set("Content-Type", "text/html; charset=UTF-8")
 			outHeader.Set("Cache-Control", "no-cache, no-store, must-revalidate")
-		}
-	case strings.HasPrefix(ct, "text/css"):
-		out, truncated = p.renderCSS(resp, body, target)
-		if !truncated {
+		case strings.HasPrefix(ct, "text/css"):
 			outHeader.Set("Content-Type", "text/css; charset=UTF-8")
-		}
-	default: // javascript and anything else text-ish
-		out, truncated = p.renderJS(resp, body, target)
-		if !truncated {
+		default:
 			outHeader.Set("Content-Type", ct+"; charset=UTF-8")
 		}
 	}
@@ -373,13 +388,18 @@ func (p *Proxy) writeResponse(w http.ResponseWriter, r *http.Request, resp *http
 		}
 		w.WriteHeader(resp.StatusCode)
 		_, _ = w.Write(out)
-		_, _ = io.Copy(w, body)
+		if _, err := io.Copy(w, body); err != nil {
+			log.Printf("[siteproxy] stream upstream remainder for %s: %v", target.Host, err)
+		}
 		return
 	}
 	if len(out) == 0 {
 		// Upstream parity: an empty body is not injected into and is
-		// forwarded as-is (the original returns body=undefined).
-		outHeader.Del("Content-Type")
+		// forwarded as-is (the original returns body=undefined). Keep the
+		// upstream Content-Type exactly as sent instead of dropping it.
+		if orig := resp.Header.Get("Content-Type"); orig != "" {
+			outHeader.Set("Content-Type", orig)
+		}
 		outHeader.Set("Content-Length", "0")
 		w.WriteHeader(resp.StatusCode)
 		return
@@ -387,6 +407,15 @@ func (p *Proxy) writeResponse(w http.ResponseWriter, r *http.Request, resp *http
 	outHeader.Set("Content-Length", fmt.Sprint(len(out)))
 	w.WriteHeader(resp.StatusCode)
 	_, _ = w.Write(out)
+}
+
+// clearResponseHeader removes every header already staged on w so that an
+// error response after reading the upstream body does not leak control
+// cookies or representation headers into the 502.
+func clearResponseHeader(h http.Header) {
+	for k := range h {
+		delete(h, k)
+	}
 }
 
 // flushWriter flushes the underlying http.Flusher after every successful
@@ -409,49 +438,58 @@ func (fw flushWriter) Write(p []byte) (int, error) {
 func (p *Proxy) publicPrefix() string { return p.cfg.ProxyURL + p.cfg.TokenPrefix }
 
 // renderHTML buffers, rewrites and injects scripts into HTML documents.
-func (p *Proxy) renderHTML(resp *http.Response, body io.Reader, target *TargetInfo) ([]byte, bool) {
-	raw, truncated := readAllLimited(body, maxRewriteBody)
+func (p *Proxy) renderHTML(resp *http.Response, body io.Reader, target *TargetInfo) ([]byte, bool, error) {
+	raw, truncated, err := readAllLimited(body, maxRewriteBody)
+	if err != nil {
+		return nil, false, err
+	}
 	if truncated {
-		return raw, true
+		return raw, true, nil
 	}
 	if len(raw) == 0 {
-		return raw, false
+		return raw, false, nil
 	}
 	html, _ := decodeHTMLBody(raw, resp.Header.Get("Content-Type"))
 	base := p.cfg.ProxyURL + p.cfg.TokenPrefix + target.SitePrefix() + target.Path
 	inject := renderInlineBootstrap(p.cfg, target.Protocol, target.Host) + injectedScriptTagAt(p.cfg.BasePath())
-	return []byte(rewriteHTML(html, p.publicPrefix(), base, p.proxyHost(), inject)), false
+	return []byte(rewriteHTML(html, p.publicPrefix(), base, p.proxyHost(), inject)), false, nil
 }
 
 // renderCSS rewrites url(...) / @import inside stylesheets (upstream node
 // pipeline).
-func (p *Proxy) renderCSS(resp *http.Response, body io.Reader, target *TargetInfo) ([]byte, bool) {
-	raw, truncated := readAllLimited(body, maxRewriteBody)
+func (p *Proxy) renderCSS(resp *http.Response, body io.Reader, target *TargetInfo) ([]byte, bool, error) {
+	raw, truncated, err := readAllLimited(body, maxRewriteBody)
+	if err != nil {
+		return nil, false, err
+	}
 	if truncated {
-		return raw, true
+		return raw, true, nil
 	}
 	if len(raw) == 0 {
-		return raw, false
+		return raw, false, nil
 	}
 	txt, _ := decodeTextBody(raw, resp.Header.Get("Content-Type"))
 	base := p.cfg.ProxyURL + p.cfg.TokenPrefix + target.SitePrefix() + target.Path
-	return []byte(rewriteCSS(string(txt), p.publicPrefix(), base, p.proxyHost())), false
+	return []byte(rewriteCSS(string(txt), p.publicPrefix(), base, p.proxyHost())), false, nil
 }
 
 // renderJS rewrites the window.location assignment forms inside JavaScript
 // files (upstream node shape) and prepends the ___location bootstrap line.
 // Static string literals are intentionally left untouched - the injected
 // client runtime traps fetch / XHR / sendBeacon at call time instead.
-func (p *Proxy) renderJS(resp *http.Response, body io.Reader, target *TargetInfo) ([]byte, bool) {
-	raw, truncated := readAllLimited(body, maxRewriteBody)
+func (p *Proxy) renderJS(resp *http.Response, body io.Reader, target *TargetInfo) ([]byte, bool, error) {
+	raw, truncated, err := readAllLimited(body, maxRewriteBody)
+	if err != nil {
+		return nil, false, err
+	}
 	if truncated {
-		return raw, true
+		return raw, true, nil
 	}
 	if len(raw) == 0 {
-		return raw, false
+		return raw, false, nil
 	}
 	txt, _ := decodeTextBody(raw, resp.Header.Get("Content-Type"))
-	return []byte(jsBootstrapLine + rewriteJSFile(string(txt))), false
+	return []byte(jsBootstrapLine + rewriteJSFile(string(txt))), false, nil
 }
 
 // ----------------------------------------------------------------------------
@@ -463,12 +501,14 @@ func (p *Proxy) renderJS(resp *http.Response, body io.Reader, target *TargetInfo
 const maxRewriteBody = 16 << 20
 
 // readAllLimited reads r fully, reporting whether the limit was exceeded.
-func readAllLimited(r io.Reader, limit int64) ([]byte, bool) {
+// Any read error is returned to the caller: a truncated upstream transfer
+// must not be rewritten and served as a successful partial page.
+func readAllLimited(r io.Reader, limit int64) ([]byte, bool, error) {
 	data, err := io.ReadAll(io.LimitReader(r, limit+1))
-	if err != nil && len(data) == 0 {
-		return nil, false
+	if err != nil {
+		return data, false, err
 	}
-	return data, int64(len(data)) > limit
+	return data, int64(len(data)) > limit, nil
 }
 
 func contentType(ct string) string {

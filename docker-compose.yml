@@ -14,3 +14,5 @@ services:
       # - SITEPROXY_TOKEN_PREFIX=/user-your-password/
       # - SITEPROXY_LOCAL_LISTEN_PORT=5006
       # - SITEPROXY_BLOCKED_SITES=a.com,b.com
+      # - SITEPROXY_COOKIE_MAX_AGE=1800
+      # - SITEPROXY_USE_ENV_PROXY=1
