@@ -35,6 +35,17 @@ func isHTMLSpace(c byte) bool {
 	return c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\f'
 }
 
+// isUnquotedValueEnd reports whether an unquoted attribute value ends at i.
+// The "/" of an XHTML-style "<meta charset=gbk/>" is tag syntax, not part of
+// the value; without this, "gbk/" is treated as an unknown charset and the
+// body is never transcoded.
+func isUnquotedValueEnd(tag string, i int) bool {
+	if isHTMLSpace(tag[i]) || tag[i] == '>' {
+		return true
+	}
+	return tag[i] == '/' && i+1 < len(tag) && tag[i+1] == '>'
+}
+
 // metaAttrValue parses one attribute of a <meta> tag. Walking the tag
 // attribute-by-attribute (instead of regex-matching "charset=" anywhere)
 // keeps a description/OG attribute whose value merely mentions
@@ -76,7 +87,7 @@ func metaAttrValue(tag, want string) (string, bool) {
 				}
 			} else {
 				vs := i
-				for i < n && !isHTMLSpace(tag[i]) && tag[i] != '>' {
+				for i < n && !isUnquotedValueEnd(tag, i) {
 					i++
 				}
 				val = tag[vs:i]
@@ -135,7 +146,7 @@ func metaAttrSpan(tag, want string) (int, int, bool) {
 			}
 		} else {
 			vs := i
-			for i < n && !isHTMLSpace(tag[i]) && tag[i] != '>' {
+			for i < n && !isUnquotedValueEnd(tag, i) {
 				i++
 			}
 			if name == want {

@@ -160,8 +160,15 @@ async function handleFetch(event) {
       siteHost = url.host; // cross-origin request: use its own host
     }
     if (siteHost !== PROXY_HOST) {
+      // Same-origin requests are still under the deployment base path; that
+      // prefix is proxy routing, not part of the target site's path.
+      let targetPath = url.pathname;
+      if (url.host === PROXY_HOST && PROXY_BASE_PATH &&
+          (targetPath === PROXY_BASE_PATH || targetPath.startsWith(PROXY_BASE_PATH + '/'))) {
+        targetPath = targetPath.substring(PROXY_BASE_PATH.length) || '/';
+      }
       const search = unrewriteText(url.search);
-      fetchURL = PROXY_URL_PREFIX + siteProto + '/' + siteHost + url.pathname + search;
+      fetchURL = PROXY_URL_PREFIX + siteProto + '/' + siteHost + targetPath + search;
     }
   }
 

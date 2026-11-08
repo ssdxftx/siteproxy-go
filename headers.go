@@ -44,6 +44,10 @@ var (
 		"Reporting-Endpoints", "X-Xss-Protection",
 		"Nel", // Network Error Logging points at the upstream origin
 		"Clear-Site-Data", "Public-Key-Pins",
+		// HSTS is scoped to the proxy host in the browser, not to the
+		// upstream origin; forwarding it could pin (and break) the proxy
+		// domain for every other proxied site.
+		"Strict-Transport-Security",
 		"Alt-Svc", "Alt-Used", // never advertise the upstream origin
 	}
 )
@@ -116,6 +120,12 @@ func rewriteResponseHeaders(cfg *Config, resp *http.Response, out http.Header, t
 	if bodyProcessed {
 		strip["content-encoding"] = true
 		strip["content-length"] = true
+		// Integrity metadata describes the ORIGIN bytes; the rewritten body
+		// no longer matches it.
+		strip["content-md5"] = true
+		strip["digest"] = true
+		strip["content-digest"] = true
+		strip["repr-digest"] = true
 	}
 
 	for name, vals := range resp.Header {
@@ -128,7 +138,7 @@ func rewriteResponseHeaders(cfg *Config, resp *http.Response, out http.Header, t
 			continue
 		}
 		switch strings.ToLower(name) {
-		case "location", "refresh", "set-cookie", "link":
+		case "refresh", "set-cookie", "link":
 			continue // handled below
 		}
 		for _, v := range vals {
@@ -142,9 +152,12 @@ func rewriteResponseHeaders(cfg *Config, resp *http.Response, out http.Header, t
 		sitePrefix = target.SitePrefix()
 	}
 
-	// Location: absolute -> proxied path; relative -> site-scoped path.
-	if loc := resp.Header.Get("Location"); loc != "" {
-		out.Set("Location", rewriteRedirect(loc, publicPrefix, sitePrefix, hostOfURL(cfg.ProxyURL)))
+	// Location: only real redirects are rewritten. 300/304/305/306/309 keep
+	// the origin header verbatim, matching the upstream pipeline.
+	if isRedirectStatus(resp.StatusCode) {
+		if loc := resp.Header.Get("Location"); loc != "" {
+			out.Set("Location", rewriteRedirect(loc, publicPrefix, sitePrefix, hostOfURL(cfg.ProxyURL)))
+		}
 	}
 	if ref := resp.Header.Get("Refresh"); ref != "" {
 		out.Set("Refresh", rewriteRefreshHeader(ref, publicPrefix, sitePrefix, hostOfURL(cfg.ProxyURL)))
@@ -167,14 +180,9 @@ func rewriteResponseHeaders(cfg *Config, resp *http.Response, out http.Header, t
 		}
 	}
 
-	// Upstream parity: the node pipeline defaults a missing content-type
-	// to text/plain; browsers then never sniff an untyped body as HTML.
-	// Bodyless status codes (204/304) must stay header-free: a generated
-	// Content-Type there is both meaningless and differs from the upstream.
-	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusNotModified &&
-		out.Get("Content-Type") == "" && resp.Header.Get("Content-Type") == "" {
-		out.Set("Content-Type", "text/plain; charset=UTF-8")
-	}
+	// An untyped body is left untyped: net/http sniffs it exactly like a
+	// browser would. Forcing text/plain here (as an earlier revision did)
+	// made untyped HTML render as source text instead of a document.
 }
 
 // rewriteRedirect maps a Location header value into proxy space (absolute

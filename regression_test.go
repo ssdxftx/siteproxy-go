@@ -57,14 +57,18 @@ func TestOriginHeaderRestoredFromNewReferer(t *testing.T) {
 		t.Errorf("Origin not restored from newreferer: %s", body)
 	}
 
-	// Proxied Referer without siteproxy-newreferer must also restore Origin.
+	// A proxied Referer without siteproxy-newreferer must be un-rewritten,
+	// but Origin is the TARGET origin (v2.7.11), not the referer's origin.
 	ref := ts.URL + token + "https/from.example.com/page"
 	_, body = proxyGet(ts, base+"/echo", map[string]string{
 		"Origin":  ts.URL,
 		"Referer": ref,
 	})
-	if !strings.Contains(string(body), `"origin":"https://from.example.com"`) {
-		t.Errorf("Origin not restored from Referer: %s", body)
+	if !strings.Contains(string(body), `"origin":"`+up.URL+`"`) {
+		t.Errorf("Origin is not the target origin: %s", body)
+	}
+	if !strings.Contains(string(body), `"referer":"https://from.example.com/page"`) {
+		t.Errorf("Referer not un-rewritten: %s", body)
 	}
 }
 
@@ -568,5 +572,18 @@ func TestMetaDescriptionDoesNotDeclareCharset(t *testing.T) {
 	}
 	if cs, _ := htmlBodyCharset([]byte(`<meta name="description" content="foo charset=gbk bar">`), ""); cs != "" {
 		t.Fatalf("htmlBodyCharset returned %q for a description-only document", cs)
+	}
+}
+
+func TestMetaCharsetSelfClosingUnquoted(t *testing.T) {
+	gbk := func(s string) []byte {
+		out, _ := simplifiedchinese.GBK.NewEncoder().Bytes([]byte(s))
+		return out
+	}
+	raw := append([]byte(`<html><head><meta charset=gbk/></head><body>`), gbk("中文")...)
+	raw = append(raw, []byte(`</body></html>`)...)
+	html, used := decodeHTMLBody(raw, "text/html")
+	if used == "" || !strings.Contains(html, "中文") {
+		t.Fatalf("self-closing unquoted charset not decoded: used=%q html=%q", used, html)
 	}
 }

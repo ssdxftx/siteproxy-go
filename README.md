@@ -346,8 +346,9 @@ Service Worker 会自动带上该前缀。
    从代理形式还原为真实目标；`Cookie` 因 Path 隔离天然只含当前站点；透传 POST/PUT 请求体。
 3. **WebSocket**：`Upgrade: websocket` 请求走 hijack 双向管道，完整支持 Telegram Web 等长连接。
 4. **上游抓取**：不跟随重定向（302 交给浏览器在代理内继续）；`Accept-Encoding: gzip, deflate, br`。
-5. **响应侧**：剥离 CSP / COOP / COEP / X-Frame-Options；`Location` / `Refresh` / `Set-Cookie` 重写
-   （Cookie 按站点隔离到 `Path={token}{proto}/{host}`）；SSE 与二进制逐块透传。
+5. **响应侧**：剥离 CSP / COOP / COEP / HSTS 等会作用于代理域的安全头；仅对
+   301/302/303/307/308 重写 `Location`（300/304/305/306/309 原样保留），并重写
+   `Refresh` / `Set-Cookie`（Cookie 按站点隔离到 `Path={token}{proto}/{host}`）；SSE 与二进制逐块透传。
 6. **文本重写**：HTML（属性 / srcset / style / meta refresh / `<base>`）注入运行时脚本；CSS（url() / @import）；
    JS（引号包裹的绝对 URL 字面量，正则字面量不受影响）。
 7. **字符集**：GBK/Big5/Shift-JIS 等自动转码为 UTF-8 并注入 `<meta charset>`。
@@ -400,12 +401,20 @@ Go 版面向 VPS 部署（与原版 Node VPS 部署方式一致）。原版为�
 `x-siteproxy-body-headers` 头走私机制不再需要（Go/nginx 无此限制）。
 
 **Q: 与原版有哪些有意的行为差异（差分测试结论）？**
-对原版 v2.7.11 做过四轮逐请求差分审计（mock 上游 + 真实站点 + 去混淆源码逐函数比对；第二至四轮
+对原版 v2.7.11 做过五轮逐请求差分审计（mock 上游 + 真实站点 + 去混淆源码逐函数比对；第二至五轮
 将 HTML/JS/CSS 重写输出、srcset 解析、请求头过滤、Location/Cookie/HEAD 行为逐字节比对到与 node 模式一致），
 以下为经过验证的差异：
 - **压缩响应**：Go 自行解码 gzip/deflate/br 后重写；可运行的 worker bundle 对照中，上游未解码并直接回传压缩字节，Go 的文本重写更完整。
   遇到双方都无法解码的编码（如 zstd）时，原版直接 500 崩溃，Go 版原样透传（保留 Content-Encoding，不重写）。
-- **空 Content-Type**：两版都不重写正文；上游不补响应头，Go 版补 `text/plain; charset=UTF-8` 以阻止浏览器把无类型字节嗅探成 HTML（安全加固）。
+- **空 Content-Type**：两版都不补响应头、不重写正文；浏览器按内容嗅探（HTML 会正常渲染）。Go 不再强制 `text/plain`。
+- **非重定向 3xx**：仅 301/302/303/307/308 丢弃正文并重写 `Location`；300/304/305/306/309 保留正文与原始 `Location`（与 node 模式一致）。
+- **206 Partial Content**：Go 原样流式透传字节段并保留 `Content-Range`；上游会把字节段当完整文档重写，导致 `Content-Length` 与 `Content-Range` 冲突。
+- **损坏的 gzip**：Go 回放解码器已消费的头部字节后原样透传；上游直接 500。
+- **Referer / Origin**：带 `Siteproxy-Newreferer` 时 Origin 取该 URL 的 origin；否则从代理 Referer 还原 Referer，
+  并把 Origin 设为**目标站点** origin（与 node 模式逐请求验证一致）。WebSocket 额外从 Referer 还原页面 origin，
+  以支持跨域 socket 的 Origin 校验。
+- **HSTS**：Go 剥离 `Strict-Transport-Security`（该头会作用于代理域而非上游域）；原版会原样转发。
+- **自闭合 meta charset**：`<meta charset=gbk/>` 按 `gbk` 解析（原版同样支持，早期 Go 解析成 `gbk/` 导致不转码）。
 - **空响应体**：两版一致——不注入；有 `Content-Type` 时保留并返回空体，无 `Content-Type` 时 Go 同样不追加控制 cookie。
 - **cookie 生命周期**：默认与原版一致，给非控制 Set-Cookie 统一追加 `Max-Age=1800`（30 分钟上限）；
   可用 `cookie_max_age_seconds: 0` 保留上游原始过期策略。`Domain` 仍一律剥离成 host-only。
@@ -433,7 +442,8 @@ Go 版面向 VPS 部署（与原版 Node VPS 部署方式一致）。原版为�
   Element.setAttribute 陷阱与 data-src 重写（与原版客户端对齐）。
 以下行为已与原版 node 模式对齐：URL 格式、常见 HTML/CSS/JS 重写、注入脚本与内联引导脚本、
 cookie 路径隔离、431 超大 Cookie 自愈、out-of-scope 路径修复、CSP 剥离、字符集转码、
-空响应体、`Location`/`Refresh`/`Set-Cookie`/`Link` 头处理。
+空响应体、`Location`（仅 301/302/303/307/308）/`Set-Cookie` 头处理。`Refresh` / `Link` 头重写是
+Go 版的安全增强（原版保留真实上游 URL，浏览器会绕过代理直连）。
 
 **Q: 如何修改首页网站列表？**
 编辑 `assets/index.html` 后重新 `make build`（资源以 go:embed 打包进二进制）。

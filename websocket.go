@@ -83,11 +83,22 @@ func (p *Proxy) proxyWebSocket(w http.ResponseWriter, r *http.Request, target *T
 	if realOrigin != "" {
 		if real := UnrewriteURLWithBase(realOrigin, p.cfg.TokenPrefix, p.cfg.BasePath()); real != realOrigin {
 			realOrigin = originOf(real)
-		} else if sameOrigin(realOrigin, p.cfg.ProxyURL) {
-			// Browsers send the proxy origin for WebSocket handshakes.
-			// Upstream sites commonly validate Origin, so present the
-			// target origin instead of the proxy's.
-			realOrigin = target.Protocol + "://" + target.Host
+		} else if p.isProxyOrigin(realOrigin, r) {
+			// Browsers send the proxy origin for WebSocket handshakes. The
+			// page's real origin is the correct Origin for both same-site and
+			// cross-site sockets; recover it from the proxied Referer. Only
+			// when no usable Referer exists fall back to the target origin.
+			pageOrigin := ""
+			if ref := r.Header.Get("Referer"); ref != "" {
+				if real, ok := p.unrewriteReferer(ref); ok && real != "" {
+					pageOrigin = originOf(real)
+				}
+			}
+			if pageOrigin != "" {
+				realOrigin = pageOrigin
+			} else {
+				realOrigin = target.Protocol + "://" + target.Host
+			}
 		}
 	}
 

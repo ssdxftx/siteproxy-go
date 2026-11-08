@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/tls"
 	"fmt"
 	"io"
@@ -198,18 +199,26 @@ func (p *Proxy) buildUpstreamRequest(r *http.Request, target *TargetInfo) (*http
 	// NOTE: the original siteproxy does not send X-Forwarded-For to
 	// upstream targets, so we do not either (parity + privacy).
 
-	// Referer / Origin: convert proxied URLs back into real ones. When the
-	// client runtime supplies the real referer, its origin is authoritative:
-	// browsers send `Origin: <proxy>` on POST, which must never reach the
-	// upstream as-is (v2.7.11 sets Origin from siteproxy-newreferer).
+	// Referer / Origin: convert proxied URLs back into real ones.
+	//
+	// v2.7.11 semantics (verified by differential probing):
+	//   - Siteproxy-Newreferer wins; Origin is that URL's origin.
+	//   - Otherwise a proxied Referer is un-rewritten, and Origin is the
+	//     TARGET origin (not the referer's origin). Browsers send
+	//     `Origin: <proxy>` on POST, which must never reach the upstream.
+	//   - A real Referer is forwarded unchanged; a proxy Origin is replaced
+	//     by the target origin, any other Origin is left alone.
+	newReferer := r.Header.Get("Siteproxy-Newreferer")
 	realReferer := ""
 	refererFromProxy := false
-	if nr := r.Header.Get("Siteproxy-Newreferer"); nr != "" {
-		realReferer = nr
+	switch {
+	case newReferer != "":
+		realReferer = newReferer
 		refererFromProxy = true
 		upReq.Header.Del("Siteproxy-Newreferer")
-	} else if ref := r.Header.Get("Referer"); ref != "" {
-		if real := UnrewriteURLWithBase(ref, p.cfg.TokenPrefix, p.cfg.BasePath()); real != ref {
+	case r.Header.Get("Referer") != "":
+		ref := r.Header.Get("Referer")
+		if real, ok := p.unrewriteReferer(ref); ok {
 			realReferer = real
 			refererFromProxy = true
 		} else {
@@ -218,16 +227,19 @@ func (p *Proxy) buildUpstreamRequest(r *http.Request, target *TargetInfo) (*http
 	}
 	if realReferer != "" {
 		upReq.Header.Set("Referer", realReferer)
-		if refererFromProxy &&
-			(strings.HasPrefix(realReferer, "http://") || strings.HasPrefix(realReferer, "https://")) {
-			upReq.Header.Set("Origin", originOf(realReferer))
+	}
+	if refererFromProxy {
+		if newReferer != "" {
+			upReq.Header.Set("Origin", originOf(newReferer))
+		} else {
+			upReq.Header.Set("Origin", target.Protocol+"://"+target.Host)
 		}
 	}
 	if upReq.Header.Get("Origin") == "" {
 		if org := r.Header.Get("Origin"); org != "" {
 			if real := UnrewriteURLWithBase(org, p.cfg.TokenPrefix, p.cfg.BasePath()); real != org {
 				upReq.Header.Set("Origin", originOf(real))
-			} else if sameOrigin(org, p.cfg.ProxyURL) {
+			} else if p.isProxyOrigin(org, r) {
 				// No usable referer: browsers still send the proxy origin.
 				upReq.Header.Set("Origin", target.Protocol+"://"+target.Host)
 			} else {
@@ -257,11 +269,73 @@ func (p *Proxy) buildUpstreamRequest(r *http.Request, target *TargetInfo) (*http
 	return upReq, body, nil
 }
 
+// isRedirectStatus reports whether a status code is one the upstream treats
+// as a redirect: 301/302/303/307/308. Other 3xx responses (300 Multiple
+// Choices, 304, 305, 306, 309) keep their body and Location header.
+func isRedirectStatus(code int) bool {
+	switch code {
+	case http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther,
+		http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
+		return true
+	}
+	return false
+}
+
+// unrewriteReferer converts a proxied absolute Referer back to the real URL.
+// Unlike UnrewriteURLWithBase it mirrors the upstream string splice exactly:
+// no trailing slash is added for a bare host, malformed escapes survive, and
+// the token root maps to an empty referer (which the caller still treats as
+// "came from the proxy").
+func (p *Proxy) unrewriteReferer(ref string) (string, bool) {
+	// Work on the path, not on cfg.ProxyURL: the public URL may be a
+	// different host/port than the listening socket (tests, reverse proxies),
+	// and a deployment may live under a base path.
+	i := strings.Index(ref, "://")
+	if i < 0 {
+		return "", false
+	}
+	rest := ref[i+3:]
+	j := strings.IndexByte(rest, '/')
+	if j < 0 {
+		return "", false
+	}
+	path := rest[j:]
+	query := ""
+	if k := strings.IndexByte(path, '?'); k >= 0 {
+		query = path[k+1:]
+		path = path[:k]
+	}
+	if bp := p.cfg.BasePath(); bp != "" && (path == bp || strings.HasPrefix(path, bp+"/")) {
+		path = strings.TrimPrefix(path, bp)
+		if path == "" {
+			path = "/"
+		}
+	}
+	if tp := p.cfg.TokenPrefix; tp != "/" {
+		if !strings.HasPrefix(path, tp) {
+			return "", false
+		}
+		path = path[len(tp):]
+	}
+	if path == "" {
+		return "", true
+	}
+	m := pathPrefixRe.FindStringSubmatch(path)
+	if m == nil {
+		return path, true
+	}
+	real := m[1] + "://" + m[2] + m[3]
+	if query != "" {
+		real += "?" + query
+	}
+	return real, true
+}
+
 // writeResponse streams/rewrites the upstream response back to the browser.
 func (p *Proxy) writeResponse(w http.ResponseWriter, r *http.Request, resp *http.Response, target *TargetInfo) {
 	outHeader := w.Header()
 	needsProcess := bodyNeedsProcess(resp)
-	isRedirect := resp.StatusCode >= 300 && resp.StatusCode < 400
+	isRedirect := isRedirectStatus(resp.StatusCode)
 	isHead := r.Method == http.MethodHead
 
 	// Decompress on the fly before rewriting. When the encoding cannot be
@@ -271,13 +345,20 @@ func (p *Proxy) writeResponse(w http.ResponseWriter, r *http.Request, resp *http
 	// relies on the same rule: only encodings it can decode are consumed).
 	// Redirect bodies and HEAD responses are not forwarded, so there is
 	// nothing to decode for them.
-	body := resp.Body
+	var body io.Reader = resp.Body
 	if needsProcess && !isRedirect && !isHead {
 		if enc := resp.Header.Get("Content-Encoding"); enc != "" && !strings.EqualFold(enc, "identity") {
-			if dec, ok := newDecoderChain(enc, body); ok {
+			// Record every byte the decoder constructors read. gzip.NewReader
+			// consumes the header before it can report a corrupt stream; on
+			// failure the fallback must replay those bytes or the response
+			// would advertise the origin Content-Length while sending a
+			// shorter body (the client then waits forever).
+			rec := &recordingReader{r: body}
+			if dec, ok := newDecoderChain(enc, rec); ok {
 				body = io.NopCloser(dec)
 			} else {
 				needsProcess = false
+				body = io.MultiReader(bytes.NewReader(rec.buf), body)
 			}
 		}
 	}
@@ -441,6 +522,23 @@ func clearResponseHeader(h http.Header) {
 	}
 }
 
+// recordingReader keeps a copy of every byte read from the wrapped reader.
+// It is used while constructing decompression decoders: those constructors
+// may consume a header before failing, and the verbatim fallback has to
+// replay the consumed prefix.
+type recordingReader struct {
+	r   io.Reader
+	buf []byte
+}
+
+func (rr *recordingReader) Read(p []byte) (int, error) {
+	n, err := rr.r.Read(p)
+	if n > 0 {
+		rr.buf = append(rr.buf, p[:n]...)
+	}
+	return n, err
+}
+
 // flushWriter flushes the underlying http.Flusher after every successful
 // write, so streamed chunks are delivered immediately.
 type flushWriter struct {
@@ -496,7 +594,10 @@ func (p *Proxy) renderCSS(resp *http.Response, body io.Reader, target *TargetInf
 		return raw, false, nil
 	}
 	txt, used := decodeTextBody(raw, resp.Header.Get("Content-Type"))
-	if used != "" {
+	// Normalise @charset whenever the bytes really are UTF-8, even if the
+	// HTTP header (not the @charset) was what told us so. Leaving a stale
+	// "@charset gbk" in a UTF-8 stylesheet makes the browser re-decode it.
+	if used != "" || utf8.Valid(txt) {
 		txt = rewriteCSSCharset(txt)
 	}
 	base := p.cfg.ProxyURL + p.cfg.TokenPrefix + target.SitePrefix() + target.Path
@@ -557,8 +658,19 @@ func bodyNeedsProcess(resp *http.Response) bool {
 	if resp.StatusCode == http.StatusNotModified {
 		return false // 304 carries no body; keep representation headers as-is
 	}
+	// A 206 body is a byte range, not a document: rewriting it would both
+	// corrupt the payload and advertise a Content-Length that no longer
+	// matches Content-Range. Stream ranges verbatim.
+	if resp.StatusCode == http.StatusPartialContent || resp.Header.Get("Content-Range") != "" {
+		return false
+	}
 	if resp.StatusCode >= 500 {
 		return false // upstream keeps error bodies verbatim (status < 500 rewrite)
+	}
+	// A download is a byte-for-byte artifact, not a navigable document.
+	// Injecting the runtime into it would change the file the user saves.
+	if cd := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Disposition"))); strings.HasPrefix(cd, "attachment") {
+		return false
 	}
 	ct := contentType(resp.Header.Get("Content-Type"))
 	if ct == "" {
@@ -583,6 +695,21 @@ func isJavaScriptContentType(ct string) bool {
 		return true
 	}
 	return strings.HasSuffix(ct, "+js")
+}
+
+// isProxyOrigin reports whether origin is this proxy. The configured public
+// URL is authoritative, but a reverse proxy / test setup may expose the
+// service under a different host; the inbound Host is then the second
+// candidate. Without this, `Origin: <proxy>` can leak upstream.
+func (p *Proxy) isProxyOrigin(origin string, r *http.Request) bool {
+	if sameOrigin(origin, p.cfg.ProxyURL) {
+		return true
+	}
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	return sameOrigin(origin, scheme+"://"+r.Host)
 }
 
 // sameOrigin compares two absolute URLs by scheme://host.

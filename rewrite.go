@@ -124,6 +124,11 @@ func rewriteHTMLWithCharset(html, publicPrefix, baseProxiedURL, proxyHost, injec
 	// Stash them first and restore after the URL pipeline.
 	html, scriptBodies := extractScriptBodies(html)
 
+	// A meta CSP would apply to the proxied document and can block the
+	// injected runtime / rewritten resources. The response header is already
+	// stripped; remove the document-level equivalents too.
+	html = stripMetaCSP(html)
+
 	// The output is normally UTF-8, so normalise any legacy charset meta
 	// while script bodies are still stashed (never touch JS strings).
 	if rewriteCharset {
@@ -218,6 +223,24 @@ func rewriteQuotedAttrs(html string, re *regexp.Regexp, fn func(string) string) 
 			return g[5] + g[6] + fn(g[7]) + g[8]
 		}
 		return g[9] + fn(g[10])
+	})
+}
+
+// stripMetaCSP removes document-level CSP declarations. The HTTP header is
+// stripped in headers.go; without this, <meta http-equiv="Content-Security-
+// Policy" content="default-src 'none'"> would still block the injected
+// runtime and every proxied subresource.
+func stripMetaCSP(html string) string {
+	return metaTagRe.ReplaceAllStringFunc(html, func(tag string) string {
+		v, ok := metaAttrValue(tag, "http-equiv")
+		if !ok {
+			return tag
+		}
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "content-security-policy", "x-content-security-policy", "x-webkit-csp":
+			return ""
+		}
+		return tag
 	})
 }
 

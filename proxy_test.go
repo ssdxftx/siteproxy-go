@@ -40,8 +40,11 @@ func startMockUpstream(t *testing.T) *httptest.Server {
 	mux.HandleFunc("/html", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=UTF-8")
 		w.Header().Set("Content-Security-Policy", "default-src 'none'")
+		w.Header().Set("Strict-Transport-Security", "max-age=31536000")
 		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("Content-MD5", "deadbeef")
 		fmt.Fprint(w, `<!DOCTYPE html><html><head><title>t</title>
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'">
 <link rel="stylesheet" href="/style.css">
 <script src="/app.js" integrity="sha384-abc" crossorigin="anonymous"></script>
 </head><body>
@@ -319,6 +322,15 @@ func TestHTMLRewriteAndInjection(t *testing.T) {
 	}
 	if resp.Header.Get("X-Frame-Options") != "" {
 		t.Error("X-Frame-Options not stripped")
+	}
+	if resp.Header.Get("Strict-Transport-Security") != "" {
+		t.Error("HSTS must not be scoped to the proxy host")
+	}
+	if resp.Header.Get("Content-MD5") != "" {
+		t.Error("Content-MD5 must be stripped from a rewritten body")
+	}
+	if strings.Contains(html, "Content-Security-Policy") {
+		t.Error("meta CSP not stripped")
 	}
 
 	// Attribute rewrites.

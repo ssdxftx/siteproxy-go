@@ -297,8 +297,9 @@ func TestEmptyContentTypeNotProcessed(t *testing.T) {
 	if strings.Contains(string(body), "___location") {
 		t.Errorf("untyped body must not be treated as JavaScript: %q", body)
 	}
-	if ct := resp.Header.Get("Content-Type"); ct != "" && !strings.HasPrefix(ct, "text/plain") {
-		t.Errorf("untyped body must stay untyped (or default to text/plain), got %q", ct)
+	if ct := resp.Header.Get("Content-Type"); ct != "" &&
+		!strings.HasPrefix(ct, "application/octet-stream") {
+		t.Errorf("untyped body must stay untyped (or be sniffed as binary), got %q", ct)
 	}
 }
 
