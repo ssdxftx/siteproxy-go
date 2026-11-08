@@ -400,8 +400,8 @@ Go 版面向 VPS 部署（与原版 Node VPS 部署方式一致）。原版为�
 `x-siteproxy-body-headers` 头走私机制不再需要（Go/nginx 无此限制）。
 
 **Q: 与原版有哪些有意的行为差异（差分测试结论）？**
-对原版 v2.7.11 做过三轮逐请求差分审计（mock 上游 + 真实站点 + 去混淆源码逐函数比对；第二、三轮
-将 HTML/JS/CSS 重写输出、srcset 解析、请求头过滤、Location/Cookie 行为逐字节比对到与 node 模式一致），
+对原版 v2.7.11 做过四轮逐请求差分审计（mock 上游 + 真实站点 + 去混淆源码逐函数比对；第二至四轮
+将 HTML/JS/CSS 重写输出、srcset 解析、请求头过滤、Location/Cookie/HEAD 行为逐字节比对到与 node 模式一致），
 以下为经过验证的差异：
 - **压缩响应**：Go 自行解码 gzip/deflate/br 后重写；可运行的 worker bundle 对照中，上游未解码并直接回传压缩字节，Go 的文本重写更完整。
   遇到双方都无法解码的编码（如 zstd）时，原版直接 500 崩溃，Go 版原样透传（保留 Content-Encoding，不重写）。

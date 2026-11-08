@@ -6,7 +6,6 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"unicode/utf8"
 )
 
 func TestCSSDataURINotRewritten(t *testing.T) {
@@ -79,6 +78,30 @@ func TestHeadDoesNotSetControlCookies(t *testing.T) {
 	}
 }
 
+func TestHeadKeepsContentEncodingAndLength(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.Header().Set("Content-Encoding", "gzip")
+		w.Header().Set("Content-Length", "10")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer up.Close()
+	ts, base := startProxy(t, up.URL)
+
+	req, _ := http.NewRequest(http.MethodHead, ts.URL+base+"/compressed", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if got := resp.Header.Get("Content-Encoding"); got != "gzip" {
+		t.Errorf("HEAD Content-Encoding = %q, want gzip", got)
+	}
+	if got := resp.Header.Get("Content-Length"); got != "10" {
+		t.Errorf("HEAD Content-Length = %q, want 10", got)
+	}
+}
+
 func TestTruncatedUpstreamReturns502(t *testing.T) {
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hj := w.(http.Hijacker)
@@ -98,10 +121,11 @@ func TestTruncatedUpstreamReturns502(t *testing.T) {
 	}
 }
 
-func TestUnknownCharsetProducesValidUTF8(t *testing.T) {
-	s, _ := decodeBytes([]byte{0xff, 0xfe, 0x41}, "x-foo")
-	if !utf8.ValidString(s) {
-		t.Errorf("decodeBytes returned invalid UTF-8: %q", s)
+func TestDecodeBytesUnknownCharsetKeepsBytes(t *testing.T) {
+	raw := []byte{0xff, 0xfe, 0x41}
+	s, used := decodeBytes(raw, "x-foo")
+	if used != "" || s != string(raw) {
+		t.Errorf("decodeBytes changed unknown-charset bytes: %q (used %q)", s, used)
 	}
 }
 

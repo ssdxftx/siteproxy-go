@@ -262,15 +262,17 @@ func (p *Proxy) writeResponse(w http.ResponseWriter, r *http.Request, resp *http
 	outHeader := w.Header()
 	needsProcess := bodyNeedsProcess(resp)
 	isRedirect := resp.StatusCode >= 300 && resp.StatusCode < 400
+	isHead := r.Method == http.MethodHead
 
 	// Decompress on the fly before rewriting. When the encoding cannot be
 	// decoded here (zstd, corrupt stream, unknown coding), the body must be
 	// forwarded VERBATIM with its Content-Encoding intact - stripping the
 	// header would make the browser render undecodable bytes (the upstream
 	// relies on the same rule: only encodings it can decode are consumed).
-	// Redirect bodies are discarded, so there is nothing to decode.
+	// Redirect bodies and HEAD responses are not forwarded, so there is
+	// nothing to decode for them.
 	body := resp.Body
-	if needsProcess && !isRedirect {
+	if needsProcess && !isRedirect && !isHead {
 		if enc := resp.Header.Get("Content-Encoding"); enc != "" && !strings.EqualFold(enc, "identity") {
 			if dec, ok := newDecoderChain(enc, body); ok {
 				body = io.NopCloser(dec)
@@ -280,17 +282,13 @@ func (p *Proxy) writeResponse(w http.ResponseWriter, r *http.Request, resp *http
 		}
 	}
 
-	rewriteResponseHeaders(p.cfg, resp, outHeader, target, needsProcess)
+	// HEAD has no body to rewrite, so keep the origin representation headers
+	// (including Content-Length and Content-Encoding) exactly as sent. This
+	// is what the upstream does and avoids advertising a compressed length
+	// without its encoding.
+	rewriteResponseHeaders(p.cfg, resp, outHeader, target, needsProcess && !isHead)
 
-	if r.Method == http.MethodHead {
-		// HEAD carries no body, so the rewritten length is unknowable. Keep
-		// the origin's Content-Length (upstream does the same) instead of
-		// dropping the header entirely; clients use HEAD to size resources.
-		if cl := resp.Header.Get("Content-Length"); cl != "" {
-			outHeader.Set("Content-Length", cl)
-		} else {
-			outHeader.Del("Content-Length")
-		}
+	if isHead {
 		w.WriteHeader(resp.StatusCode)
 		return
 	}

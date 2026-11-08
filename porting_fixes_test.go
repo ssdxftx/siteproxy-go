@@ -96,6 +96,13 @@ func TestFaviconUsesOutOfScopeRepair(t *testing.T) {
 	if resp == nil || resp.StatusCode != http.StatusOK || string(body) != "real-icon" {
 		t.Fatalf("favicon repair status=%v body=%q", resp, body)
 	}
+	// A Referer for the target root carrying a query string must parse the
+	// same way (the old raw string split put "host?x=1" into the host).
+	rootRef := up.URL + token + "http/" + host + "?x=1"
+	resp, body = proxyGet(ts, "/favicon.ico", map[string]string{"Referer": rootRef})
+	if resp == nil || resp.StatusCode != http.StatusOK || string(body) != "real-icon" {
+		t.Fatalf("favicon repair with root query status=%v body=%q", resp, body)
+	}
 }
 
 func TestEmptyAnd204DoNotGainControlCookies(t *testing.T) {
@@ -200,5 +207,17 @@ func TestProtocolRelativeSelfUserinfoStripped(t *testing.T) {
 	got := RewriteWithBase("//u:p@p.example/x", pp, pp+"http/t.example/page", "p.example")
 	if strings.Contains(got, "u:p@") || got != "//p.example/x" {
 		t.Fatalf("self protocol-relative userinfo not stripped: %q", got)
+	}
+}
+
+func TestUnknownCharsetKeepsOriginalBytes(t *testing.T) {
+	raw := []byte{0x81, 0x82, 0xff}
+	html, used := decodeHTMLBody(raw, "text/html; charset=x-unknown")
+	if used != "" || html != string(raw) {
+		t.Fatalf("unknown HTML charset: used=%q html=%q want raw", used, html)
+	}
+	txt, used := decodeTextBody(raw, "text/css; charset=x-unknown")
+	if used != "" || string(txt) != string(raw) {
+		t.Fatalf("unknown text charset: used=%q txt=%q want raw", used, txt)
 	}
 }

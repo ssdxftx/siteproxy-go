@@ -310,7 +310,10 @@ func isUTF8(cs string) bool {
 	return cs == "" || cs == "utf8" || cs == "utf-8" || cs == "us-ascii" || cs == "ascii"
 }
 
-// decodeBytes converts raw bytes in charset cs to a UTF-8 string.
+// decodeBytes converts raw bytes in charset cs to a UTF-8 string. When the
+// charset is unknown or decoding fails it returns the original bytes and an
+// empty used value, so callers keep the original encoding instead of
+// advertising UTF-8 for replacement-character data.
 func decodeBytes(raw []byte, cs string) (string, string) {
 	cs = normalizeCharset(cs)
 
@@ -320,16 +323,20 @@ func decodeBytes(raw []byte, cs string) (string, string) {
 
 	enc, err := htmlindex.Get(cs)
 	if err != nil {
-		return strings.ToValidUTF8(string(raw), "\uFFFD"), ""
+		// Unknown charset: keep the original bytes. Returning a
+		// replacement-character UTF-8 string here would make the caller
+		// advertise UTF-8 and destroy data we never decoded.
+		return string(raw), ""
 	}
 	out, err := enc.NewDecoder().Bytes(raw)
 	if err != nil {
-		return strings.ToValidUTF8(string(raw), "\uFFFD"), ""
+		return string(raw), ""
 	}
 	return string(out), cs
 }
 
 func decodeUTF16(raw []byte, cs string) (string, string) {
+	orig := raw
 	var name string
 	switch {
 	case bytes.HasPrefix(raw, bomUTF16LE):
@@ -351,7 +358,7 @@ func decodeUTF16(raw []byte, cs string) (string, string) {
 	}
 	out, err := enc.NewDecoder().Bytes(raw)
 	if err != nil {
-		return strings.ToValidUTF8(string(raw), "\uFFFD"), ""
+		return string(orig), ""
 	}
 	return string(out), name
 }

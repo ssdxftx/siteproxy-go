@@ -96,6 +96,9 @@
     var c = parseCurrentLocation();
     proxy_real_protocol = c.protocol;
     proxy_real_host = c.host;
+    // Relative URLs must resolve against the new page URL after an SPA
+    // pushState/replaceState/popstate, not the URL cached at first use.
+    realBaseCache = null;
     notifyServiceWorker();
   }
 
@@ -115,8 +118,10 @@
   }
 
   // Exact proxy-host check (a prefix check would wrongly match hosts such
-  // as "proxy.example.evil"). Compares effective ports too, so an omitted
-  // default port (http://proxy vs http://proxy:80) is still recognised.
+  // as "proxy.example.evil"). Compare effective ports too, and treat two
+  // default-port URLs as the same proxy even when the schemes differ:
+  // http://proxy and https://proxy are both the configured proxy, while
+  // https://proxy:8443 is a different service and must not be swallowed.
   function isProxyHostURL(url) {
     try {
       var u = new URL(url, location.href);
@@ -124,8 +129,9 @@
       var portOf = function (x) {
         return x.port || (x.protocol === 'https:' ? '443' : '80');
       };
-      return u.hostname.toLowerCase() === p.hostname.toLowerCase() &&
-             portOf(u) === portOf(p);
+      if (u.hostname.toLowerCase() !== p.hostname.toLowerCase()) return false;
+      if (portOf(u) === portOf(p)) return true;
+      return u.port === '' && p.port === '';
     } catch (e) { return false; }
   }
 
@@ -437,11 +443,15 @@
   // ___-prefixed aliases; keep them rewriting like the upstream node script.
   history.___pushState = function (state, title, url) {
     var rewritten = (url !== undefined && url !== null) ? proxyRewrite(String(url)) : url;
-    return originalPushState.call(this, state, title, rewritten);
+    var out = originalPushState.call(this, state, title, rewritten);
+    refreshCurrentLocation();
+    return out;
   };
   history.___replaceState = function (state, title, url) {
     var rewritten = (url !== undefined && url !== null) ? proxyRewrite(String(url)) : url;
-    return originalReplaceState.call(this, state, title, rewritten);
+    var out = originalReplaceState.call(this, state, title, rewritten);
+    refreshCurrentLocation();
+    return out;
   };
 
   var originalOpen = window.open ? window.open.bind(window) : null;

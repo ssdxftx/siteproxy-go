@@ -18,14 +18,13 @@ import (
 //	/siteproxy-response-injected.js    -> client runtime script
 //	/siteproxy_service_worker.js       -> client service worker
 //	{token_prefix}{proto}/{host}/...   -> proxied target
-//	anything else                      -> homepage (same as upstream siteproxy)
+//	anything else                      -> 404 (or the token-scoped homepage)
 type Server struct {
 	cfg    *Config
 	proxy  *Proxy
 	client *http.Client
 
-	injectedTemplate []byte
-	homepageHTML     []byte
+	homepageHTML []byte
 }
 
 // NewServer wires the routing table and prepares the embedded assets.
@@ -37,11 +36,10 @@ func NewServer(cfg *Config) (*Server, error) {
 	}
 
 	return &Server{
-		cfg:              cfg,
-		proxy:            p,
-		client:           client,
-		injectedTemplate: assetsInjected,
-		homepageHTML:     renderHomepage(cfg),
+		cfg:          cfg,
+		proxy:        p,
+		client:       client,
+		homepageHTML: renderHomepage(cfg),
 	}, nil
 }
 
@@ -246,9 +244,11 @@ func (s *Server) repairOutOfScope(r *http.Request) *TargetInfo {
 	var proto, host string
 	prefix := s.cfg.ProxyURL + s.cfg.TokenPrefix
 	if ref := r.Header.Get("Referer"); strings.HasPrefix(ref, prefix) {
-		parts := strings.Split(strings.TrimPrefix(ref, prefix), "/")
-		if len(parts) >= 2 {
-			proto, host = parts[0], parts[1]
+		// Parse the full Referer instead of splitting the raw string: a page
+		// at the target root with a query string (e.g. /token/http/host?x=1)
+		// would otherwise put "host?x=1" into the host and fail validation.
+		if t := targetFromProxiedURL(ref, s.cfg.TokenPrefix, s.cfg.BasePath()); t != nil {
+			proto, host = t.Protocol, t.Host
 		}
 	}
 	if proto == "" || host == "" {
