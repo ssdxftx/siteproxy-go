@@ -18,29 +18,171 @@ import (
 // ----------------------------------------------------------------------------
 
 var (
-	metaCharsetRe     = regexp.MustCompile(`(?is)<meta[^>]+charset\s*=\s*["']?\s*([a-z0-9_\-]+)`)
 	xmlEncodingRe     = regexp.MustCompile(`(?is)<\?xml[^>]+encoding\s*=\s*["']([a-z0-9_\-]+)`)
 	bomUTF16LE        = []byte{0xFF, 0xFE}
 	bomUTF16BE        = []byte{0xFE, 0xFF}
 	bomUTF8           = []byte{0xEF, 0xBB, 0xBF}
-	sniffWindowBytes  = 4096
+	sniffWindowBytes  = 64 << 10
 	supportedCharset  = regexp.MustCompile(`(?i)^(gb2312|gbk|gb18030|big5|big5-hkscs|shift[_-]?jis|sjis|euc-?jp|euc-?kr|iso-?8859-[0-9]+|windows-12[0-9][0-9]|koi8-[ru]|latin[1-9])$`)
 	utf16CharsetNames = regexp.MustCompile(`(?i)^utf-?16(le|be|)?$`)
+	cssCharsetRe      = regexp.MustCompile(`(?i)^\s*@charset\s+["']([^"']+)["']\s*;`)
+	charsetParamRe    = regexp.MustCompile(`(?i)^charset\s*=\s*(.+)$`)
 
-	metaTagRe            = regexp.MustCompile(`(?is)<meta(?:[^>"']|"[^"]*"|'[^']*')*>`)
-	metaContentTypeTagRe = regexp.MustCompile(`(?is)<meta\s+(?:[^>]*?\s)?http-equiv\s*=\s*["']?Content-Type["']?[^>]*>`)
-	metaCharsetAttrRe    = regexp.MustCompile(`(?i)charset\s*=\s*["']?[0-9a-zA-Z_\-]+["']?`)
+	metaTagRe = regexp.MustCompile(`(?is)<meta(?:[^>"']|"[^"]*"|'[^']*')*>`)
 )
+
+func isHTMLSpace(c byte) bool {
+	return c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\f'
+}
+
+// metaAttrValue parses one attribute of a <meta> tag. Walking the tag
+// attribute-by-attribute (instead of regex-matching "charset=" anywhere)
+// keeps a description/OG attribute whose value merely mentions
+// "charset=gbk" from being mistaken for a real charset declaration.
+func metaAttrValue(tag, want string) (string, bool) {
+	i := len("<meta")
+	n := len(tag)
+	for i < n {
+		for i < n && isHTMLSpace(tag[i]) {
+			i++
+		}
+		if i >= n || tag[i] == '>' || tag[i] == '/' {
+			break
+		}
+		start := i
+		for i < n && !isHTMLSpace(tag[i]) && tag[i] != '=' && tag[i] != '>' {
+			i++
+		}
+		name := strings.ToLower(tag[start:i])
+		for i < n && isHTMLSpace(tag[i]) {
+			i++
+		}
+		val := ""
+		if i < n && tag[i] == '=' {
+			i++
+			for i < n && isHTMLSpace(tag[i]) {
+				i++
+			}
+			if i < n && (tag[i] == '"' || tag[i] == '\'') {
+				q := tag[i]
+				i++
+				vs := i
+				for i < n && tag[i] != q {
+					i++
+				}
+				val = tag[vs:i]
+				if i < n {
+					i++
+				}
+			} else {
+				vs := i
+				for i < n && !isHTMLSpace(tag[i]) && tag[i] != '>' {
+					i++
+				}
+				val = tag[vs:i]
+			}
+		}
+		if name == want {
+			return strings.TrimSpace(val), true
+		}
+	}
+	return "", false
+}
+
+// metaAttrSpan returns the value span of an attribute (inside its quotes for
+// quoted values), so a charset declaration can be updated without touching
+// any other part of the tag.
+func metaAttrSpan(tag, want string) (int, int, bool) {
+	i := len("<meta")
+	n := len(tag)
+	for i < n {
+		for i < n && isHTMLSpace(tag[i]) {
+			i++
+		}
+		if i >= n || tag[i] == '>' || tag[i] == '/' {
+			break
+		}
+		start := i
+		for i < n && !isHTMLSpace(tag[i]) && tag[i] != '=' && tag[i] != '>' {
+			i++
+		}
+		name := strings.ToLower(tag[start:i])
+		for i < n && isHTMLSpace(tag[i]) {
+			i++
+		}
+		if i >= n || tag[i] != '=' {
+			if name == want {
+				return 0, 0, false
+			}
+			continue
+		}
+		i++
+		for i < n && isHTMLSpace(tag[i]) {
+			i++
+		}
+		if i < n && (tag[i] == '"' || tag[i] == '\'') {
+			q := tag[i]
+			i++
+			vs := i
+			for i < n && tag[i] != q {
+				i++
+			}
+			if name == want {
+				return vs, i, true
+			}
+			if i < n {
+				i++
+			}
+		} else {
+			vs := i
+			for i < n && !isHTMLSpace(tag[i]) && tag[i] != '>' {
+				i++
+			}
+			if name == want {
+				return vs, i, true
+			}
+		}
+	}
+	return 0, 0, false
+}
+
+// metaCharsetFromHTML returns the first real charset declaration in the
+// document. Only a charset attribute or an http-equiv=Content-Type meta is
+// considered; text inside a description/content attribute is ignored.
+func metaCharsetFromHTML(html string) string {
+	for _, tag := range metaTagRe.FindAllString(html, -1) {
+		if v, ok := metaAttrValue(tag, "charset"); ok && v != "" {
+			return v
+		}
+		if v, ok := metaAttrValue(tag, "http-equiv"); ok && strings.EqualFold(v, "Content-Type") {
+			if c, ok := metaAttrValue(tag, "content"); ok {
+				if cs := charsetFromContentType(c); cs != "" {
+					return cs
+				}
+			}
+		}
+	}
+	return ""
+}
 
 // rewriteCharsetMeta updates legacy charset declarations after transcoding so
 // the browser cannot override the UTF-8 response with the original GBK/etc.
-// This mirrors the upstream `_0x504211` helper.
+// This mirrors the upstream `_0x504211` helper. Only real charset declarations
+// are touched: a description/OG tag containing the literal text "charset=..."
+// must not have its visible content rewritten.
 func rewriteCharsetMeta(html string) string {
 	return metaTagRe.ReplaceAllStringFunc(html, func(tag string) string {
-		if metaContentTypeTagRe.MatchString(tag) {
+		if v, ok := metaAttrValue(tag, "http-equiv"); ok && strings.EqualFold(v, "Content-Type") {
 			return charsetMetaSnippet
 		}
-		return metaCharsetAttrRe.ReplaceAllString(tag, `charset=UTF-8`)
+		if _, ok := metaAttrValue(tag, "charset"); !ok {
+			return tag
+		}
+		start, end, ok := metaAttrSpan(tag, "charset")
+		if !ok {
+			return tag
+		}
+		return tag[:start] + "UTF-8" + tag[end:]
 	})
 }
 
@@ -64,8 +206,7 @@ func decodeHTMLBody(raw []byte, contentTypeHeader string) (string, string) {
 	if len(window) > sniffWindowBytes {
 		window = window[:sniffWindowBytes]
 	}
-	if m := metaCharsetRe.FindSubmatch(window); m != nil {
-		cs := string(m[1])
+	if cs := metaCharsetFromHTML(string(window)); cs != "" {
 		if !isUTF8(cs) {
 			return decodeBytes(raw, cs)
 		}
@@ -100,8 +241,7 @@ func htmlBodyCharset(raw []byte, contentTypeHeader string) (string, bool) {
 	if len(window) > sniffWindowBytes {
 		window = window[:sniffWindowBytes]
 	}
-	if m := metaCharsetRe.FindSubmatch(window); m != nil {
-		cs := string(m[1])
+	if cs := metaCharsetFromHTML(string(window)); cs != "" {
 		return cs, utf16CharsetNames.MatchString(cs)
 	}
 	if m := xmlEncodingRe.FindSubmatch(window); m != nil {
@@ -111,13 +251,30 @@ func htmlBodyCharset(raw []byte, contentTypeHeader string) (string, bool) {
 	if cs := charsetFromContentType(contentTypeHeader); cs != "" {
 		return cs, utf16CharsetNames.MatchString(cs)
 	}
-	return "utf-8", false
+	return "", false
 }
 
-// decodeTextBody transcodes a plain-text (CSS/JS) body to UTF-8 using the
-// declared header charset only (meta sniffing does not apply).
+// decodeTextBody transcodes a plain-text (CSS/JS) body to UTF-8. The declared
+// HTTP charset wins; when it is absent, a CSS @charset declaration and byte
+// order marks are honoured (UTF-16 files otherwise cannot be prepended to with
+// the ASCII bootstrap line).
 func decodeTextBody(raw []byte, contentTypeHeader string) ([]byte, string) {
+	switch {
+	case bytes.HasPrefix(raw, bomUTF16LE):
+		out, used := decodeUTF16(raw, "utf-16le")
+		return []byte(out), used
+	case bytes.HasPrefix(raw, bomUTF16BE):
+		out, used := decodeUTF16(raw, "utf-16be")
+		return []byte(out), used
+	case bytes.HasPrefix(raw, bomUTF8):
+		raw = bytes.TrimPrefix(raw, bomUTF8)
+	}
 	cs := charsetFromContentType(contentTypeHeader)
+	if cs == "" {
+		if m := cssCharsetRe.FindSubmatch(raw); m != nil {
+			cs = string(m[1])
+		}
+	}
 	if cs == "" || isUTF8(cs) {
 		return raw, ""
 	}
@@ -125,12 +282,24 @@ func decodeTextBody(raw []byte, contentTypeHeader string) ([]byte, string) {
 	return []byte(out), used
 }
 
-// charsetFromContentType extracts charset=xxx from a Content-Type header.
+// rewriteCSSCharset replaces a leading @charset declaration with UTF-8 after
+// the body was transcoded, so CSS clients do not re-decode the UTF-8 bytes
+// with the old legacy encoding.
+func rewriteCSSCharset(css []byte) []byte {
+	s := string(css)
+	if loc := cssCharsetRe.FindStringIndex(s); loc != nil {
+		s = `@charset "UTF-8";` + s[loc[1]:]
+	}
+	return []byte(s)
+}
+
+// charsetFromContentType extracts charset=xxx from a Content-Type header,
+// accepting optional whitespace around '=' (e.g. "charset = gbk").
 func charsetFromContentType(ct string) string {
 	for _, part := range strings.Split(ct, ";") {
 		part = strings.TrimSpace(part)
-		if strings.HasPrefix(strings.ToLower(part), "charset=") {
-			return strings.Trim(strings.TrimPrefix(part[len("charset="):], ""), `"'`)
+		if m := charsetParamRe.FindStringSubmatch(part); m != nil {
+			return strings.Trim(m[1], `"' `)
 		}
 	}
 	return ""

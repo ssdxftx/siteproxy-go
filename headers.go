@@ -169,7 +169,10 @@ func rewriteResponseHeaders(cfg *Config, resp *http.Response, out http.Header, t
 
 	// Upstream parity: the node pipeline defaults a missing content-type
 	// to text/plain; browsers then never sniff an untyped body as HTML.
-	if out.Get("Content-Type") == "" && resp.Header.Get("Content-Type") == "" {
+	// Bodyless status codes (204/304) must stay header-free: a generated
+	// Content-Type there is both meaningless and differs from the upstream.
+	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusNotModified &&
+		out.Get("Content-Type") == "" && resp.Header.Get("Content-Type") == "" {
 		out.Set("Content-Type", "text/plain; charset=UTF-8")
 	}
 }

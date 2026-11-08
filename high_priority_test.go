@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -81,7 +82,7 @@ func TestSubpathInjectionAndServiceWorker(t *testing.T) {
 		t.Errorf("service worker scope is not base-path aware")
 	}
 
-	resp, _ = proxyGet(ts, "/sub/siteproxy_service_worker.js?proxy_real_protocol=https&proxy_real_host=t.example", nil)
+	resp, _ = proxyGet(ts, "/sub/siteproxy_service_worker.js?proxy_real_protocol=https&proxy_real_host=t.example&token_prefix=" + url.QueryEscape("/tok/"), nil)
 	if resp == nil || resp.StatusCode != 200 {
 		t.Fatalf("service worker status = %v", resp)
 	}

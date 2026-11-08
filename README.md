@@ -21,7 +21,7 @@ user browser +--------------->+ siteproxy-go   +-------> wikipedia
 | token_prefix 密码保护 | ✅ | ✅ |
 | HTML/CSS/JS 服务端 URL 重写（href/src/srcset/action/url()/@import） | ✅ | ✅ 含 v2.7.x 各项修复（srcset 逗号、style 内 url()、自引用防双包等） |
 | 客户端运行时（location / history / window.open / fetch / XHR / sendBeacon 覆盖） | ✅ 混淆 | ✅ 明文重写；另额外覆盖 WebSocket / EventSource |
-| Service Worker（越界请求修复、404 重试、PROXY_CUR_LOCATION 同步） | ✅ 混淆 | ✅ 明文重写 |
+| Service Worker（越界请求修复、404 延迟返回、PROXY_CUR_LOCATION 同步） | ✅ 混淆 | ✅ 明文重写 |
 | Cookie 按站点隔离（v2.6.0） | ✅ | ✅ Path 改写 + document.cookie 拦截 + 控制 cookie 过滤（Domain/Max-Age 策略见 FAQ） |
 | CSP / X-Frame-Options / COOP / COEP 剥离 | ✅ | ✅ |
 | GBK / GB18030 / Big5 / Shift-JIS / EUC-KR 自动转码为 UTF-8 | ✅ | ✅（含 meta 嗅探与 charset 注入） |
@@ -32,7 +32,7 @@ user browser +--------------->+ siteproxy-go   +-------> wikipedia
 | 被墙站点黑名单 | ➖ node 模式忽略 blocked_sites | ✅ 仅显式配置生效 |
 | 首页（solarized 明暗双主题） | ✅ | ✅ 原版移植 |
 | Duck.ai / 常用网站入口 | ✅ | ✅ 首页内置链接 |
-| 单文件部署 | ❌ 需 Node 22 | ✅ ~10MB 静态二进制 |
+| 单文件部署 | ❌ 需 Node 22 | ✅ ~11MB 静态二进制 |
 | RSA+AES 密码加密提交 | ✅（面向公共站 netptop.com） | ➖ 未实现，见 FAQ |
 
 ## 快速开始
@@ -70,7 +70,7 @@ linux/amd64、linux/arm64、darwin/amd64、darwin/arm64、windows/amd64、freebs
 | 字段 | 说明 |
 |------|------|
 | `proxy_url` | 对外访问的完整地址（nginx 反代之后的公网 URL），用于生成代理链接、判断 HTTPS |
-| `token_prefix` | 访问密码，**首尾斜杠必须保留**；空字符串回退到原版默认 token `/default/`，显式设为 `"/"` 表示免密码（Go 扩展，启动时会打印警告） |
+| `token_prefix` | 访问密码，**首尾斜杠必须保留**；空字符串回退到上游默认 token `/user22334455/`，显式设为 `"/"` 表示免密码（Go 扩展，启动时会打印警告） |
 | `local_listen_port` | 监听端口（默认 5006，与原版/nginx 配置兼容） |
 | `blocked_sites` | 禁止代理的站点列表；仅按此处显式配置生效，不内置任何域名 |
 | `cookie_max_age_seconds` | 非控制 Cookie 的生命周期上限，默认 `1800`（与原版一致）；设为 `0` 保留上游原始过期策略 |
@@ -103,6 +103,8 @@ export SITEPROXY_USE_ENV_PROXY=1
 ```
 http://127.0.0.1:5006/user22334455/https/example.com/
 ```
+
+> 启用 `token_prefix` 时，公开根路径 `/` 返回 404（避免把带 token 的首页泄露给未认证访问者）；首页入口是 `http://127.0.0.1:5006/user22334455/`。
 
 按 `Ctrl+C` 停止。本地 HTTP 仅用于测试，公网部署请使用下面的 nginx + TLS。
 
@@ -339,7 +341,7 @@ Service Worker 会自动带上该前缀。
 
 一次请求经过的完整流水线：
 
-1. **路由**：`/{token_prefix}https/{host}/{path}` → 鉴权 → 解析目标；其余路径回落到首页。
+1. **路由**：`/{token_prefix}https/{host}/{path}` → 鉴权 → 解析目标；错误 token、未知路径和非法目标返回 404；`/{token_prefix}/` 是启用密码时的首页入口（公开 `/` 不再返回含 token 的首页）。
 2. **请求侧**：剥离 hop-by-hop 与 CDN 注入头（`cf-*`、`x-forwarded-*` 等）；`Referer`/`Origin`
    从代理形式还原为真实目标；`Cookie` 因 Path 隔离天然只含当前站点；透传 POST/PUT 请求体。
 3. **WebSocket**：`Upgrade: websocket` 请求走 hijack 双向管道，完整支持 Telegram Web 等长连接。
@@ -351,7 +353,7 @@ Service Worker 会自动带上该前缀。
 7. **字符集**：GBK/Big5/Shift-JIS 等自动转码为 UTF-8 并注入 `<meta charset>`。
 8. **浏览器端**：注入脚本以源码形式提供 `proxyRewrite()`（与原版规则一致），覆盖
    location / pushState / fetch / XHR / WebSocket / EventSource / sendBeacon / document.URL，
-   并注册 Service Worker 修复越界子资源请求与 404 重试。
+   并注册 Service Worker 修复越界子资源请求；404 仅延迟 3 秒返回，不重发。
 
 ## 项目结构
 
@@ -401,10 +403,10 @@ Go 版面向 VPS 部署（与原版 Node VPS 部署方式一致）。原版为�
 对原版 v2.7.11 做过三轮逐请求差分审计（mock 上游 + 真实站点 + 去混淆源码逐函数比对；第二、三轮
 将 HTML/JS/CSS 重写输出、srcset 解析、请求头过滤、Location/Cookie 行为逐字节比对到与 node 模式一致），
 以下为经过验证的差异：
-- **压缩响应**：node/Go 行为等价——node 依赖 undici 自动解压后重写，Go 自行解码 gzip/deflate/br 后重写；
+- **压缩响应**：Go 自行解码 gzip/deflate/br 后重写；可运行的 worker bundle 对照中，上游未解码并直接回传压缩字节，Go 的文本重写更完整。
   遇到双方都无法解码的编码（如 zstd）时，原版直接 500 崩溃，Go 版原样透传（保留 Content-Encoding，不重写）。
-- **空 Content-Type**：两版一致——均不重写、按二进制透传（node 默认按 text/plain 处理，Go 同样不注入）。
-- **空响应体**：两版一致——不注入、保留上游 `Content-Type` 并返回空体。
+- **空 Content-Type**：两版都不重写正文；上游不补响应头，Go 版补 `text/plain; charset=UTF-8` 以阻止浏览器把无类型字节嗅探成 HTML（安全加固）。
+- **空响应体**：两版一致——不注入；有 `Content-Type` 时保留并返回空体，无 `Content-Type` 时 Go 同样不追加控制 cookie。
 - **cookie 生命周期**：默认与原版一致，给非控制 Set-Cookie 统一追加 `Max-Age=1800`（30 分钟上限）；
   可用 `cookie_max_age_seconds: 0` 保留上游原始过期策略。`Domain` 仍一律剥离成 host-only。
 - **Secure / SameSite 归一**：HTTPS 部署下原样保留 `Secure` 与 `SameSite=None/Strict`；纯 HTTP 部署下去掉 `Secure`，并仅把浏览器会拒收的 `SameSite=None` 改为 `Lax`。

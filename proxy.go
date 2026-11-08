@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // Proxy implements the core request/response pipeline.
@@ -281,20 +282,15 @@ func (p *Proxy) writeResponse(w http.ResponseWriter, r *http.Request, resp *http
 
 	rewriteResponseHeaders(p.cfg, resp, outHeader, target, needsProcess)
 
-	// Control cookies (HttpOnly): let the server-side out-of-scope repair
-	// and the service worker resolve the current site even when page
-	// scripts have not set their own copies yet. The upstream appends
-	// them ONLY for text bodies it actually rewrites (html/js/css with
-	// status < 500) - matching that keeps Cookie headers small.
-	if target != nil && needsProcess && r.Method != http.MethodHead {
-		outHeader.Add("Set-Cookie",
-			"proxy_real_protocol="+target.Protocol+"; Path=/; HttpOnly")
-		outHeader.Add("Set-Cookie",
-			"proxy_real_host="+target.Host+"; Path=/; HttpOnly")
-	}
-
 	if r.Method == http.MethodHead {
-		outHeader.Del("Content-Length")
+		// HEAD carries no body, so the rewritten length is unknowable. Keep
+		// the origin's Content-Length (upstream does the same) instead of
+		// dropping the header entirely; clients use HEAD to size resources.
+		if cl := resp.Header.Get("Content-Length"); cl != "" {
+			outHeader.Set("Content-Length", cl)
+		} else {
+			outHeader.Del("Content-Length")
+		}
 		w.WriteHeader(resp.StatusCode)
 		return
 	}
@@ -304,6 +300,9 @@ func (p *Proxy) writeResponse(w http.ResponseWriter, r *http.Request, resp *http
 	// stays as the origin sent it (304 is exempt from the text/plain
 	// fallback applied to untyped bodies).
 	if isRedirect {
+		if needsProcess {
+			p.addControlCookies(outHeader, target)
+		}
 		outHeader.Del("Content-Length")
 		w.WriteHeader(resp.StatusCode)
 		return
@@ -353,14 +352,19 @@ func (p *Proxy) writeResponse(w http.ResponseWriter, r *http.Request, resp *http
 		return
 	}
 	if !truncated {
-		switch {
-		case strings.HasPrefix(ct, "text/html"):
-			outHeader.Set("Content-Type", "text/html; charset=UTF-8")
-			outHeader.Set("Cache-Control", "no-cache, no-store, must-revalidate")
-		case strings.HasPrefix(ct, "text/css"):
-			outHeader.Set("Content-Type", "text/css; charset=UTF-8")
-		default:
-			outHeader.Set("Content-Type", ct+"; charset=UTF-8")
+		// Only advertise UTF-8 when the rewritten bytes really are UTF-8.
+		// For an undecodable legacy body (no header/meta charset) preserve
+		// the upstream Content-Type so the browser can still sniff/guess
+		// instead of being forced into mojibake.
+		if utf8.Valid(out) {
+			switch {
+			case strings.HasPrefix(ct, "text/html"):
+				outHeader.Set("Content-Type", "text/html; charset=UTF-8")
+			case strings.HasPrefix(ct, "text/css"):
+				outHeader.Set("Content-Type", "text/css; charset=UTF-8")
+			default:
+				outHeader.Set("Content-Type", ct+"; charset=UTF-8")
+			}
 		}
 	}
 	if truncated {
@@ -375,10 +379,18 @@ func (p *Proxy) writeResponse(w http.ResponseWriter, r *http.Request, resp *http
 			// priority over the header; keeping a wrong header (e.g. UTF-8 on
 			// a GBK page) would render the whole oversized page as mojibake.
 			cs, isUTF16 := htmlBodyCharset(out, resp.Header.Get("Content-Type"))
-			if cs == "" || isUTF8(cs) {
-				cs = "UTF-8"
+			if cs != "" {
+				if isUTF8(cs) {
+					cs = "UTF-8"
+				}
+				outHeader.Set("Content-Type", "text/html; charset="+cs)
+			} else if utf8.Valid(out) {
+				// No declaration, but the bytes are valid UTF-8: declaring it
+				// is safe and avoids the browser guessing a legacy charset.
+				outHeader.Set("Content-Type", "text/html; charset=UTF-8")
 			}
-			outHeader.Set("Content-Type", "text/html; charset="+cs)
+			// Otherwise keep the original Content-Type (no charset) so an
+			// undeclared legacy body can still be sniffed by the browser.
 			// Inject the client runtime when the encoding is ASCII-compatible
 			// (the tag is pure ASCII, so GBK/Big5 bytes are untouched).
 			// UTF-16 bodies cannot carry an ASCII snippet.
@@ -404,9 +416,22 @@ func (p *Proxy) writeResponse(w http.ResponseWriter, r *http.Request, resp *http
 		w.WriteHeader(resp.StatusCode)
 		return
 	}
+	p.addControlCookies(outHeader, target)
 	outHeader.Set("Content-Length", fmt.Sprint(len(out)))
 	w.WriteHeader(resp.StatusCode)
 	_, _ = w.Write(out)
+}
+
+// addControlCookies adds the HttpOnly site-context cookies to responses whose
+// body is actually rewritten (or to text redirects). Empty bodies, 204/304,
+// HEAD and binary streams deliberately do not receive them: upstream does not
+// set them there either, and they would otherwise create phantom session state.
+func (p *Proxy) addControlCookies(h http.Header, target *TargetInfo) {
+	if target == nil {
+		return
+	}
+	h.Add("Set-Cookie", "proxy_real_protocol="+target.Protocol+"; Path=/; HttpOnly")
+	h.Add("Set-Cookie", "proxy_real_host="+target.Host+"; Path=/; HttpOnly")
 }
 
 // clearResponseHeader removes every header already staged on w so that an
@@ -449,10 +474,14 @@ func (p *Proxy) renderHTML(resp *http.Response, body io.Reader, target *TargetIn
 	if len(raw) == 0 {
 		return raw, false, nil
 	}
-	html, _ := decodeHTMLBody(raw, resp.Header.Get("Content-Type"))
+	html, used := decodeHTMLBody(raw, resp.Header.Get("Content-Type"))
+	// Rewrite the charset meta only when we actually produced UTF-8 (or the
+	// input already was valid UTF-8). An undeclared legacy body must keep its
+	// original meta so the browser can still sniff/guess it.
+	rewriteCharset := used != "" || utf8.Valid(raw)
 	base := p.cfg.ProxyURL + p.cfg.TokenPrefix + target.SitePrefix() + target.Path
 	inject := renderInlineBootstrap(p.cfg, target.Protocol, target.Host) + injectedScriptTagAt(p.cfg.BasePath())
-	return []byte(rewriteHTML(html, p.publicPrefix(), base, p.proxyHost(), inject)), false, nil
+	return []byte(rewriteHTMLWithCharset(html, p.publicPrefix(), base, p.proxyHost(), inject, rewriteCharset)), false, nil
 }
 
 // renderCSS rewrites url(...) / @import inside stylesheets (upstream node
@@ -468,7 +497,10 @@ func (p *Proxy) renderCSS(resp *http.Response, body io.Reader, target *TargetInf
 	if len(raw) == 0 {
 		return raw, false, nil
 	}
-	txt, _ := decodeTextBody(raw, resp.Header.Get("Content-Type"))
+	txt, used := decodeTextBody(raw, resp.Header.Get("Content-Type"))
+	if used != "" {
+		txt = rewriteCSSCharset(txt)
+	}
 	base := p.cfg.ProxyURL + p.cfg.TokenPrefix + target.SitePrefix() + target.Path
 	return []byte(rewriteCSS(string(txt), p.publicPrefix(), base, p.proxyHost())), false, nil
 }

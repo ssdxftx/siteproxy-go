@@ -73,6 +73,10 @@ func TestHeadDoesNotSetControlCookies(t *testing.T) {
 			t.Errorf("HEAD must not set control cookie: %s", c)
 		}
 	}
+	// Upstream parity: HEAD keeps the origin size rather than dropping it.
+	if cl := resp.Header.Get("Content-Length"); cl == "" {
+		t.Error("HEAD lost the upstream Content-Length")
+	}
 }
 
 func TestTruncatedUpstreamReturns502(t *testing.T) {
@@ -133,7 +137,7 @@ func TestBasePathRejectsOutsidePath(t *testing.T) {
 
 	host := strings.TrimPrefix(up.URL, "http://")
 	resp, body := proxyGet(ts, "/t/http/"+host+"/html", nil)
-	if resp == nil || !strings.Contains(string(body), "<title>Siteproxy</title>") {
+	if resp == nil || resp.StatusCode != http.StatusNotFound {
 		t.Errorf("outside-base-path request must not proxy: status=%v body=%q", resp, body)
 	}
 

@@ -8,7 +8,7 @@ import (
 	"strings"
 )
 
-const defaultTokenPrefix = "/default/"
+const defaultTokenPrefix = "/user22334455/"
 
 // Config mirrors the original siteproxy config.json so that existing users
 // can switch to the Go binary without touching their configuration.
@@ -19,7 +19,7 @@ type Config struct {
 
 	// TokenPrefix is the "password" embedded in every proxied URL, it must
 	// start and end with "/". An empty value uses the upstream default token
-	// "/default/"; an explicit "/" disables authentication (Go extension).
+	// "/user22334455/"; an explicit "/" disables authentication (Go extension).
 	TokenPrefix string `json:"token_prefix"`
 
 	// LocalListenPort is the HTTP port this server listens on.
@@ -130,8 +130,8 @@ func (c *Config) normalize() (*Config, error) {
 }
 
 // normalizeTokenPrefix ensures the prefix starts and ends with "/".
-// An empty value falls back to the upstream default token "/default/"; only an
-// explicit "/" disables authentication.
+// An empty value falls back to the upstream default token "/user22334455/";
+// only an explicit "/" disables authentication.
 func normalizeTokenPrefix(p string) string {
 	p = strings.TrimSpace(p)
 	if p == "" {

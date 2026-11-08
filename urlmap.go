@@ -111,6 +111,10 @@ func RewriteURL(rawURL, publicPrefix, proxyHost string) string {
 	if rawURL == "" {
 		return rawURL
 	}
+	// Userinfo is not representable in the path-based proxy format (the
+	// server rejects '@' in the target host). Drop it exactly like a URL
+	// parser would: credentials must never end up in a proxied path.
+	rawURL = stripUserinfo(rawURL)
 	if strings.HasPrefix(strings.ToLower(rawURL), strings.ToLower(publicPrefix)) {
 		return rawURL // already proxied (case-insensitive scheme/host)
 	}
@@ -127,6 +131,35 @@ func RewriteURL(rawURL, publicPrefix, proxyHost string) string {
 	return rawURL
 }
 
+// stripUserinfo removes "user:pass@" from an absolute or protocol-relative
+// URL authority. Credentials cannot be carried by the proxy path format and
+// must not leak into links, logs or Referer values.
+func stripUserinfo(raw string) string {
+	prefix := ""
+	rest := raw
+	switch {
+	case strings.Contains(raw, "://"):
+		i := strings.Index(raw, "://")
+		prefix = raw[:i+3]
+		rest = raw[i+3:]
+	case strings.HasPrefix(raw, "//"):
+		prefix = "//"
+		rest = raw[2:]
+	default:
+		return raw
+	}
+	end := strings.IndexAny(rest, "/?#")
+	if end < 0 {
+		end = len(rest)
+	}
+	authority := rest[:end]
+	at := strings.LastIndexByte(authority, '@')
+	if at < 0 {
+		return raw
+	}
+	return prefix + authority[at+1:] + rest[end:]
+}
+
 // RewriteWithBase rewrites any URL (absolute, protocol-relative, root- or
 // path-relative) into a fully proxied ABSOLUTE URL, using base to resolve
 // relative references. base must be a proxied absolute URL
@@ -140,7 +173,7 @@ func RewriteWithBase(rawURL, publicPrefix, baseProxiedURL, proxyHost string) str
 		// upstream regexes deliberately do not rewrite them.
 		return rawURL
 	}
-	trimmed := rawURL
+	trimmed := stripUserinfo(rawURL)
 	lower := strings.ToLower(trimmed)
 	if hasUnsupportedScheme(trimmed) {
 		return rawURL
@@ -171,7 +204,7 @@ func RewriteWithBase(rawURL, publicPrefix, baseProxiedURL, proxyHost string) str
 			return rawURL
 		}
 		if proxyHost != "" && strings.EqualFold(host, proxyHost) {
-			return rawURL // protocol-relative URL pointing at the proxy itself
+			return trimmed // protocol-relative URL pointing at the proxy itself
 		}
 		return publicPrefix + "https/" + trimmed[2:]
 	case strings.HasPrefix(trimmed, "/"):
@@ -182,10 +215,15 @@ func RewriteWithBase(rawURL, publicPrefix, baseProxiedURL, proxyHost string) str
 		return publicPrefix + proto + "/" + host + trimmed
 	default:
 		// Resolve dot segments, query-only references (?page=2) and relative
-		// paths exactly like a browser would.
-		if base, err := url.Parse(baseProxiedURL); err == nil && base.IsAbs() {
-			if ref, err := url.Parse(trimmed); err == nil {
-				return base.ResolveReference(ref).String()
+		// paths exactly like a browser would, but in TARGET URL space. Using
+		// the proxied URL as the base makes a leading "../" pop the target
+		// host segment itself (e.g. /token/http/host/../x -> /token/http/x).
+		realBase := UnrewriteURLWithBase(baseProxiedURL, tokenPrefixOf(publicPrefix), "")
+		if realBase != baseProxiedURL {
+			if base, err := url.Parse(realBase); err == nil && base.IsAbs() {
+				if ref, err := url.Parse(trimmed); err == nil {
+					return RewriteURL(base.ResolveReference(ref).String(), publicPrefix, "")
+				}
 			}
 		}
 		proto, host := baseOf(baseProxiedURL, publicPrefix)

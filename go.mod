@@ -1,4 +1,4 @@
-module github.com/netptop/siteproxy-go
+module github.com/ssdxftx/siteproxy-go
 
 go 1.26.0
 

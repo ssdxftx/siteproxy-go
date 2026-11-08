@@ -50,6 +50,17 @@ func newDecoderChain(encoding string, r io.Reader) (io.Reader, bool) {
 	if len(encs) == 0 {
 		return r, true
 	}
+	// Validate every coding BEFORE constructing any decoder. A decoder
+	// constructor may consume bytes from r (gzip.NewReader reads the header);
+	// discovering an unknown coding after that would make the caller's
+	// "forward verbatim" fallback stream a body with its head missing.
+	for _, e := range encs {
+		switch normalizeEncoding(e) {
+		case "gzip", "deflate", "br":
+		default:
+			return nil, false
+		}
+	}
 	body := r
 	for i := len(encs) - 1; i >= 0; i-- {
 		dec, ok := newDecoder(encs[i], body)

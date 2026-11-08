@@ -27,7 +27,16 @@
   if (window.siteproxy_injected_flag) return; // idempotent
   window.siteproxy_injected_flag = true;
 
-  var CONFIG = __SITEPROXY_CONFIG_JSON__;
+  // The external script is static: no config/token is baked into this file.
+  // The inline bootstrap (which always runs before this script on proxied
+  // pages) defines the globals read here. A bare direct fetch therefore gets
+  // an empty context and never exposes the configured password.
+  var CONFIG = {
+    proxy_url: (typeof window.config_proxy_url === 'string' && window.config_proxy_url) ? window.config_proxy_url : '',
+    token_prefix: (typeof window.config_token_prefix === 'string' && window.config_token_prefix) ? window.config_token_prefix : '',
+    proxy_real_protocol: (typeof window.proxy_real_protocol === 'string' && window.proxy_real_protocol) ? window.proxy_real_protocol : 'https',
+    proxy_real_host: (typeof window.proxy_real_host === 'string' && window.proxy_real_host) ? window.proxy_real_host : ''
+  };
 
   var token_prefix = CONFIG.token_prefix;
   var config_proxy_url = CONFIG.proxy_url;
@@ -106,10 +115,18 @@
   }
 
   // Exact proxy-host check (a prefix check would wrongly match hosts such
-  // as "proxy.example.evil").
+  // as "proxy.example.evil"). Compares effective ports too, so an omitted
+  // default port (http://proxy vs http://proxy:80) is still recognised.
   function isProxyHostURL(url) {
-    try { return new URL(url, location.href).host.toLowerCase() === proxyHostFull.toLowerCase(); }
-    catch (e) { return false; }
+    try {
+      var u = new URL(url, location.href);
+      var p = new URL(config_proxy_url || location.href);
+      var portOf = function (x) {
+        return x.port || (x.protocol === 'https:' ? '443' : '80');
+      };
+      return u.hostname.toLowerCase() === p.hostname.toLowerCase() &&
+             portOf(u) === portOf(p);
+    } catch (e) { return false; }
   }
 
   // Map a URL on the proxy origin but outside the token scope into the
@@ -125,6 +142,7 @@
 
   function proxyRewrite(url) {
     if (typeof url !== 'string') return url;
+    if (url === '') return url;
     if (url.toLowerCase().startsWith(proxy_url_prefix.toLowerCase())) return url;
     if (token_prefix !== '/' && url.startsWith(token_prefix)) return url;
 
@@ -133,8 +151,25 @@
     if (sm && !/^https?$/i.test(sm[1])) return url;
 
     if (url.startsWith('http://') || url.startsWith('https://')) {
+      // Userinfo is not part of the proxy path format (and would be rejected
+      // by the server as a host). Strip it like a URL parser does, before any
+      // proxy-origin check so credentials never survive in an href.
+      try {
+        var parsed = new URL(url);
+        if (parsed.username || parsed.password) {
+          url = parsed.protocol + '//' + parsed.host + parsed.pathname +
+                parsed.search + parsed.hash;
+        }
+      } catch (e) { /* keep original for non-standard URLs */ }
       if (isProxyHostURL(url)) {
-        if (url.startsWith(proxy_url_prefix)) return url;
+        // A token-scoped URL may use the other scheme (http page linking to
+        // https://proxy/{token}/...). It is already proxied: returning it
+        // unchanged avoids the old double-prefix bug. Only URLs outside the
+        // token scope are mapped into the current site.
+        try {
+          var pu = new URL(url);
+          if (stripProxyPrefixPath(pu.pathname) !== null) return url;
+        } catch (e) { /* fall through to map */ }
         return mapProxyOriginURL(url);
       }
       var protocol = url.split('://')[0];
@@ -142,6 +177,12 @@
       return proxy_url_prefix + protocol + '/' + rest;
     }
     if (url.startsWith('//')) {
+      try {
+        var pdu = new URL('https:' + url);
+        if (pdu.username || pdu.password) {
+          url = '//' + pdu.host + pdu.pathname + pdu.search + pdu.hash;
+        }
+      } catch (e) { /* keep original */ }
       if (isProxyHostURL(url)) return url;
       return proxy_url_prefix + 'https/' + url.substring(2);
     }
@@ -163,7 +204,7 @@
       var base = realBaseURL() || (proxy_real_protocol + '://' + proxy_real_host + '/');
       var resolved = new URL(url, base);
       if (resolved.origin === location.origin ||
-          resolved.host === proxyHostFull) {
+          isProxyHostURL(resolved.href)) {
         // Resolved onto the proxy origin: re-anchor into the site scope.
         var rp = stripProxyPrefixPath(resolved.pathname);
         if (rp !== null && /^(https?)\//.test(rp)) return url;
@@ -671,8 +712,13 @@
     // Control cookies (non-HttpOnly copies so page scripts / diagnostics can
     // read the current site context; the server filters them before
     // forwarding upstream).
-    document.cookie = 'proxy_real_host=' + proxy_real_host + '; path=/; max-age=3600';
-    document.cookie = 'proxy_real_protocol=' + proxy_real_protocol + '; path=/; max-age=3600';
+    // Only pages with a real target site get a control-cookie context. The
+    // homepage / bare runtime load has an empty host and must not overwrite
+    // the Path=/ control cookies with empty values.
+    if (proxy_real_host) {
+      document.cookie = 'proxy_real_host=' + proxy_real_host + '; path=/; max-age=3600';
+      document.cookie = 'proxy_real_protocol=' + proxy_real_protocol + '; path=/; max-age=3600';
+    }
   })();
 
   // ------------------------------------------------------------------
@@ -744,7 +790,8 @@
     var swScope = (proxyBasePath || '') + '/';
     var swURL = (proxyBasePath || '') + '/siteproxy_service_worker.js?proxy_real_protocol=' +
       encodeURIComponent(proxy_real_protocol) + '&proxy_real_host=' +
-      encodeURIComponent(proxy_real_host) + '&v=4';
+      encodeURIComponent(proxy_real_host) + '&token_prefix=' +
+      encodeURIComponent(token_prefix) + '&v=4';
 
     function adoptRegistration(reg) {
       if (!reg) return;
@@ -767,16 +814,27 @@
       });
     }
 
+    // A registration is reusable only when it was created for THIS token.
+    // Checking merely for "token_prefix=" would reuse an old worker after a
+    // token rotation, leaving the page scoped to the previous password.
+    function registrationMatches(reg) {
+      if (!reg || !reg.active || !reg.active.scriptURL) return false;
+      if (reg.active.scriptURL.indexOf('siteproxy_service_worker.js') === -1) return false;
+      try {
+        return new URL(reg.active.scriptURL).searchParams.get('token_prefix') === token_prefix;
+      } catch (e) {
+        return false;
+      }
+    }
+
     // Reuse an already active registration instead of registering again;
     // this mirrors upstream and lets the page get its context immediately
     // even when the worker is not controlling the page yet.
     if (typeof realSW.getRegistrations === 'function') {
       realSW.getRegistrations().then(function (regs) {
         for (var i = 0; i < regs.length; i++) {
-          var reg = regs[i];
-          if (reg.active && reg.active.scriptURL &&
-              reg.active.scriptURL.indexOf('siteproxy_service_worker.js') !== -1) {
-            adoptRegistration(reg);
+          if (registrationMatches(regs[i])) {
+            adoptRegistration(regs[i]);
             return;
           }
         }
@@ -1232,6 +1290,11 @@
 
   // Expose minimal internals for debugging.
   window.siteproxyRegReplacement = function (u) { return proxyRewrite(u); };
+  // Upstream compatibility surface: page scripts/tools may rely on urlMeta.
+  window.urlMeta = {
+    rewrite: proxyRewrite,
+    unrewrite: unRewriteURL
+  };
   window.___siteproxy = {
     proxyRewrite: proxyRewrite,
     unRewriteURL: unRewriteURL,

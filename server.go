@@ -110,17 +110,14 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		s.serveHomepage(w, r)
 		return
 	case "/siteproxy-response-injected.js":
-		// Rendered per-request: current site context comes from Referer.
+		// Static asset: it reads its per-page context from the inline
+		// bootstrap globals, never from a baked-in config.
 		s.serveInjectedScript(w, r)
 		return
 	case "/siteproxy_service_worker.js":
-		// Service worker must be served from the origin scope root and is
-		// rendered per request with the page's site context (query params,
-		// falling back to Referer), like the original server.
+		// Rendered with the registration context. The registration URL must
+		// carry the configured token; a bare public fetch is rejected.
 		s.serveServiceWorker(w, r)
-		return
-	case "/favicon.ico":
-		http.NotFound(w, r)
 		return
 	}
 
@@ -145,7 +142,12 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	case "/siteproxy_service_worker.js":
 		s.serveServiceWorker(w, r)
 		return
-	case "/favicon.ico":
+	}
+
+	// A direct /favicon.ico request has no site context only in no-password
+	// mode. With a token, let it fall through to repair so a proxied page's
+	// favicon is fetched from its real site (upstream behaviour).
+	if proxyPath == "/favicon.ico" && s.cfg.noPassword() {
 		http.NotFound(w, r)
 		return
 	}
@@ -155,26 +157,55 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		// Upstream behaviour: a path outside the token scope is still
 		// proxied when the request can be attributed to a proxied site
 		// via Referer or the control cookies (both require knowledge
-		// of the proxy session). Otherwise fall back to the homepage
-		// so token-less visits do not leak target info.
+		// of the proxy session). Otherwise 404 - never leak the
+		// token-bearing homepage to an unauthenticated request.
 		if repaired := s.repairOutOfScope(r); repaired != nil {
 			s.proxy.ServeHTTP(w, r, repaired)
 			return
 		}
-		s.serveHomepage(w, r)
+		http.NotFound(w, r)
 		return
 	}
 
 	rest := strings.TrimPrefix(proxyPath, s.cfg.TokenPrefix)
 	target := ParseTarget(rest, r.URL.RawQuery)
 	if target == nil {
-		// Inside the token scope but not a valid target: homepage
-		// fallback (same as upstream).
-		s.serveHomepage(w, r)
+		// Only the token root is a homepage entry point. Any other
+		// invalid target inside the token scope is a 404 (upstream
+		// returns 404 for /default/https, /default/http/, ...).
+		if rest == "" {
+			s.serveHomepage(w, r)
+			return
+		}
+		http.NotFound(w, r)
 		return
 	}
 
 	s.proxy.ServeHTTP(w, r, target)
+}
+
+// homepageAllowed reports whether this request may be served the homepage.
+// With password protection enabled the homepage contains token-bearing links,
+// so it is only available inside the token scope (e.g. /{token}/). The public
+// root path is deliberately 404 after this fix.
+func (s *Server) homepageAllowed(r *http.Request) bool {
+	if s.cfg.noPassword() {
+		return true
+	}
+	path := r.URL.EscapedPath()
+	if path == "" {
+		path = "/"
+	}
+	if bp := s.cfg.BasePath(); bp != "" {
+		if path != bp && !strings.HasPrefix(path, bp+"/") {
+			return false
+		}
+		path = strings.TrimPrefix(path, bp)
+		if path == "" {
+			path = "/"
+		}
+	}
+	return strings.HasPrefix(path, s.cfg.TokenPrefix)
 }
 
 // repairOutOfScope mirrors the upstream server-side repair: when the request
@@ -204,9 +235,11 @@ func (s *Server) repairOutOfScope(r *http.Request) *TargetInfo {
 			path = "/"
 		}
 	}
-	// Never repair requests for the proxy's own static assets.
+	// Never repair requests for the proxy's own static assets. /favicon.ico
+	// is intentionally NOT here: a proxied page's favicon must be fetched
+	// from its real site via the normal repair path.
 	switch path {
-	case "/siteproxy-response-injected.js", "/siteproxy_service_worker.js", "/favicon.ico":
+	case "/siteproxy-response-injected.js", "/siteproxy_service_worker.js":
 		return nil
 	}
 
@@ -308,6 +341,10 @@ func validPort(p string) bool {
 // same HTML rewriter used for proxied pages so the links stay inside the
 // proxy and the runtime scripts get injected.
 func (s *Server) serveHomepage(w http.ResponseWriter, r *http.Request) {
+	if !s.homepageAllowed(r) {
+		http.NotFound(w, r)
+		return
+	}
 	inject := renderInlineBootstrap(s.cfg, "https", "") + injectedScriptTagAt(s.cfg.BasePath())
 	html := rewriteHTML(string(s.homepageHTML), s.cfg.ProxyURL+s.cfg.TokenPrefix,
 		s.cfg.ProxyURL+s.cfg.TokenPrefix, hostOfURL(s.cfg.ProxyURL), inject)
@@ -318,10 +355,16 @@ func (s *Server) serveHomepage(w http.ResponseWriter, r *http.Request) {
 }
 
 // serveServiceWorker renders the service worker with the current site context.
-// Registration carries proxy_real_protocol/proxy_real_host as query params;
-// requests without them fall back to the page Referer so the worker still
-// knows the real origin for out-of-scope request repair.
+// The registration URL carries proxy_real_protocol/proxy_real_host and the
+// configured token_prefix. The token check is what keeps the worker (which
+// necessarily contains the token for path-scope checks) from being fetched
+// anonymously; a bare public request gets a 404 instead of the secret.
 func (s *Server) serveServiceWorker(w http.ResponseWriter, r *http.Request) {
+	token := r.URL.Query().Get("token_prefix")
+	if token != s.cfg.TokenPrefix {
+		http.NotFound(w, r)
+		return
+	}
 	proto := r.URL.Query().Get("proxy_real_protocol")
 	host := r.URL.Query().Get("proxy_real_host")
 	if proto != "http" && proto != "https" {
@@ -337,7 +380,7 @@ func (s *Server) serveServiceWorker(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	body, err := renderServiceWorker(s.cfg, proto, host)
+	body, err := renderServiceWorker(s.cfg, proto, host, token)
 	if err != nil {
 		http.Error(w, "siteproxy: render service worker: "+err.Error(), http.StatusInternalServerError)
 		return
@@ -345,19 +388,11 @@ func (s *Server) serveServiceWorker(w http.ResponseWriter, r *http.Request) {
 	s.serveStaticJS(w, r, body, s.swAllowedScope())
 }
 
-// serveInjectedScript renders siteproxy-response-injected.js with the site
-// context of the requesting page (parsed from its Referer). The script also
-// re-derives the context from location.pathname at runtime, so a missing
-// Referer is not fatal.
+// serveInjectedScript serves the static client runtime. All per-page context
+// comes from the inline bootstrap globals, so this unauthenticated endpoint
+// contains neither token_prefix nor any other secret.
 func (s *Server) serveInjectedScript(w http.ResponseWriter, r *http.Request) {
-	proto, host := "https", ""
-	if ref := r.Header.Get("Referer"); ref != "" {
-		if t := targetFromProxiedURL(ref, s.cfg.TokenPrefix, s.cfg.BasePath()); t != nil {
-			proto, host = t.Protocol, t.Host
-		}
-	}
-	body := renderInjectedScript(s.cfg, proto, host)
-	s.serveStaticJS(w, r, body, s.swAllowedScope())
+	s.serveStaticJS(w, r, assetsInjected, s.swAllowedScope())
 }
 
 // swAllowedScope returns the Service-Worker-Allowed value for a deployment:

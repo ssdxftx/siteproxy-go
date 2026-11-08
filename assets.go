@@ -25,14 +25,10 @@ func mustRead(name string) []byte {
 	return data
 }
 
-// renderInjectedScript bakes the config and the current site context into the
-// client runtime script (same technique as the original: the values are
-// inlined as JS string constants).
-func renderInjectedScript(cfg *Config, proto, host string) []byte {
-	body := string(assetsInjected)
-	body = strings.ReplaceAll(body, "__SITEPROXY_CONFIG_JSON__", jsObject(cfg, proto, host))
-	return []byte(body)
-}
+// The external runtime is served as a static asset and reads its per-page
+// config from the globals defined by the inline bootstrap. This keeps the
+// (secret) token_prefix out of an unauthenticated, directly fetchable endpoint.
+// Do not reintroduce config baking here.
 
 // renderInlineBootstrap reproduces the inline <script> block the original
 // node server injects before the external runtime (verbatim upstream text
@@ -50,22 +46,30 @@ func renderInlineBootstrap(cfg *Config, proto, host string) string {
 }
 
 // renderServiceWorker bakes the config and the current site context into the
-// service worker script. The context is supplied by the registration URL
-// (proxy_real_protocol/proxy_real_host) or derived from the Referer.
-func renderServiceWorker(cfg *Config, proto, host string) ([]byte, error) {
+// service worker script. The context (and the token, when the request is
+// authenticated by the registration query) is supplied by the registration
+// URL; a bare public fetch without a valid token gets an empty token and
+// cannot be used as an authenticated worker.
+func renderServiceWorker(cfg *Config, proto, host, token string) ([]byte, error) {
 	body := string(assetsWorker)
-	body = strings.ReplaceAll(body, "__SITEPROXY_CONFIG_JSON__", jsObject(cfg, proto, host))
+	body = strings.ReplaceAll(body, "__SITEPROXY_CONFIG_JSON__", jsObject(cfg, proto, host, token))
 	return []byte(body), nil
 }
 
-// jsObject serialises the runtime config as a JS object literal.
-func jsObject(cfg *Config, proto, host string) string {
+// jsObject serialises the runtime config as a JS object literal. tokenOverride
+// lets the service-worker endpoint use the registration token (or "" when the
+// request is not authenticated) instead of the configured secret.
+func jsObject(cfg *Config, proto, host string, tokenOverride ...string) string {
+	token := cfg.TokenPrefix
+	if len(tokenOverride) > 0 {
+		token = tokenOverride[0]
+	}
 	return fmt.Sprintf(`{
   proxy_url: %s,
   token_prefix: %s,
   proxy_real_protocol: %s,
   proxy_real_host: %s
-}`, jsString(cfg.ProxyURL), jsString(cfg.TokenPrefix), jsString(proto), jsString(host))
+}`, jsString(cfg.ProxyURL), jsString(token), jsString(proto), jsString(host))
 }
 
 // jsString serialises a value as a JavaScript/JSON string literal. JSON

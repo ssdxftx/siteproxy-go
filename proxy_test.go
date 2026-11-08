@@ -668,13 +668,10 @@ func TestTokenGate(t *testing.T) {
 	ts, base := startProxy(t, up.URL)
 	_ = base
 
-	// Wrong token → homepage.
-	resp, body := proxyGet(ts, "/wrongtoken/https/evil.com/", nil)
-	if resp.StatusCode != 200 {
-		t.Fatalf("status = %d", resp.StatusCode)
-	}
-	if !strings.Contains(string(body), "<title>Siteproxy</title>") {
-		t.Errorf("wrong token did not fall back to homepage")
+	// Wrong token → 404 (never the token-bearing homepage).
+	resp, _ := proxyGet(ts, "/wrongtoken/https/evil.com/", nil)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("wrong token status = %d, want 404", resp.StatusCode)
 	}
 
 	// Correct token → proxied.

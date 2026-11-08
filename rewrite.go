@@ -111,14 +111,24 @@ func attrValueRegex(names string) *regexp.Regexp {
 //	runtime tag) — it is page-specific because the inline bootstrap carries
 //	the current site context.
 func rewriteHTML(html, publicPrefix, baseProxiedURL, proxyHost, injectSnippet string) string {
+	return rewriteHTMLWithCharset(html, publicPrefix, baseProxiedURL, proxyHost, injectSnippet, true)
+}
+
+// rewriteHTMLWithCharset is rewriteHTML with control over the charset-meta
+// normalisation. When the body could not be decoded to UTF-8 (undeclared
+// legacy charset), rewriting the meta to UTF-8 would only make the mojibake
+// permanent; the caller therefore passes false and keeps the original meta.
+func rewriteHTMLWithCharset(html, publicPrefix, baseProxiedURL, proxyHost, injectSnippet string, rewriteCharset bool) string {
 	// Script bodies must not be touched by the URL rewriter (a regex
 	// literal or a string containing `href="..."` would be corrupted).
 	// Stash them first and restore after the URL pipeline.
 	html, scriptBodies := extractScriptBodies(html)
 
-	// The output is always UTF-8, so normalise any legacy charset meta
+	// The output is normally UTF-8, so normalise any legacy charset meta
 	// while script bodies are still stashed (never touch JS strings).
-	html = rewriteCharsetMeta(html)
+	if rewriteCharset {
+		html = rewriteCharsetMeta(html)
+	}
 
 	// 0. Quoted absolute/root-relative URLs in arbitrary tag attributes
 	//    (upstream generic quoted-URL pass). Script bodies are already
@@ -168,7 +178,7 @@ func rewriteHTML(html, publicPrefix, baseProxiedURL, proxyHost, injectSnippet st
 	//    through the injected wrappers.
 	html = restoreScriptBodies(html, scriptBodies)
 
-	return injectScripts(html, injectSnippet)
+	return injectScriptsWithCharset(html, injectSnippet, rewriteCharset)
 }
 
 const scriptBodyMarkerPrefix = "@@SITEPROXY_SCRIPT_BODY_"
@@ -473,7 +483,18 @@ func rewriteJSFile(js string) string {
 // (which gives up when no anchor exists) we still inject at the DOCTYPE or
 // document start so fragments keep working.
 func injectScripts(html, injectSnippet string) string {
-	inject := charsetMetaSnippet + injectSnippet
+	return injectScriptsWithCharset(html, injectSnippet, true)
+}
+
+// injectScriptsWithCharset injects the runtime and (optionally) the UTF-8
+// charset meta. addCharset is false when the body could not be transcoded:
+// adding a UTF-8 meta to undeclared legacy bytes would make the mojibake
+// permanent even though the HTTP header was preserved.
+func injectScriptsWithCharset(html, injectSnippet string, addCharset bool) string {
+	inject := injectSnippet
+	if addCharset {
+		inject = charsetMetaSnippet + injectSnippet
+	}
 	if loc := injectAfterHeadRe.FindStringIndex(html); loc != nil {
 		return html[:loc[1]] + inject + html[loc[1]:]
 	}

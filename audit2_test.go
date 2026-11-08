@@ -162,9 +162,10 @@ func TestRepairNotAppliedWithoutContext(t *testing.T) {
 	if resp == nil {
 		t.Fatal("no response")
 	}
-	// Without referer/cookies the request cannot be attributed: homepage.
-	if !strings.Contains(resp.Header.Get("Content-Type"), "text/html") {
-		t.Errorf("expected homepage fallback, got %s", resp.Header.Get("Content-Type"))
+	// Without referer/cookies the request cannot be attributed: upstream
+	// answers 404, and so must we (never leak the token-bearing homepage).
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("expected 404, got %d", resp.StatusCode)
 	}
 }
 

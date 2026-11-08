@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -159,7 +160,7 @@ func TestServiceWorkerContextFromQuery(t *testing.T) {
 	}
 	ts := httptest.NewServer(srv)
 	defer ts.Close()
-	resp, body := proxyGet(ts, "/siteproxy_service_worker.js?proxy_real_protocol=https&proxy_real_host=t.example", nil)
+	resp, body := proxyGet(ts, "/siteproxy_service_worker.js?proxy_real_protocol=https&proxy_real_host=t.example&token_prefix="+url.QueryEscape(token), nil)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d", resp.StatusCode)
 	}
@@ -178,7 +179,7 @@ func TestHomepageLinksAreAbsolute(t *testing.T) {
 	}
 	ts := httptest.NewServer(srv)
 	defer ts.Close()
-	resp, body := proxyGet(ts, "/", nil)
+	resp, body := proxyGet(ts, token, nil)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d", resp.StatusCode)
 	}
@@ -438,7 +439,7 @@ func TestSubpathDeploymentRoutingAndUnrewrite(t *testing.T) {
 		t.Errorf("targetFromProxiedURL = %+v", target)
 	}
 
-	resp, body = proxyGet(ts, "/sub/", nil)
+	resp, body = proxyGet(ts, "/sub/tok/", nil)
 	if resp == nil || resp.StatusCode != 200 || !strings.Contains(string(body), "<title>Siteproxy</title>") {
 		t.Errorf("subpath homepage failed: status=%v body=%q", resp, body)
 	}
@@ -531,7 +532,6 @@ func TestHTMLCharsetDeclarationUpdatedAfterTranscode(t *testing.T) {
 	}
 	for _, body := range []string{
 		`<meta charset="gbk"><div>中文</div>`,
-		`<meta name="x" content="text/html; charset=gbk"><div>中文</div>`,
 		`<meta http-equiv="Content-Type" content="text/html; charset=gbk"><div>中文</div>`,
 		`<meta data-x="1" http-equiv="Content-Type" content="text/html; charset=gbk"><div>中文</div>`,
 	} {
@@ -544,8 +544,29 @@ func TestHTMLCharsetDeclarationUpdatedAfterTranscode(t *testing.T) {
 		if strings.Contains(strings.ToLower(html), "gbk") {
 			t.Errorf("legacy charset left in document: %s", html)
 		}
-		if !strings.Contains(html, `charset=UTF-8`) || !strings.Contains(html, "中文") {
+		lower := strings.ToLower(html)
+		if !strings.Contains(lower, `charset="utf-8"`) && !strings.Contains(lower, "charset=utf-8") {
 			t.Errorf("charset meta not updated: %s", html)
 		}
+		if !strings.Contains(html, "中文") {
+			t.Errorf("body was not transcoded: %s", html)
+		}
+	}
+}
+
+func TestMetaDescriptionDoesNotDeclareCharset(t *testing.T) {
+	html := `<meta name="description" content="foo charset=gbk bar"><meta charset="gbk"><p>中文</p>`
+	out := rewriteCharsetMeta(html)
+	if !strings.Contains(out, `content="foo charset=gbk bar"`) {
+		t.Fatalf("meta description was modified: %s", out)
+	}
+	if !strings.Contains(strings.ToLower(out), `charset="utf-8"`) {
+		t.Fatalf("real charset meta was not rewritten: %s", out)
+	}
+	if cs := metaCharsetFromHTML(`<meta name="description" content="foo charset=gbk bar">`); cs != "" {
+		t.Fatalf("description text was mistaken for charset %q", cs)
+	}
+	if cs, _ := htmlBodyCharset([]byte(`<meta name="description" content="foo charset=gbk bar">`), ""); cs != "" {
+		t.Fatalf("htmlBodyCharset returned %q for a description-only document", cs)
 	}
 }
