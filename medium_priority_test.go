@@ -105,14 +105,29 @@ func TestOversizedGBKHTMLKeepsCharsetAndInjectsRuntime(t *testing.T) {
 		t.Fatalf("Content-Type = %q, want charset=gbk", ct)
 	}
 
-	tag := injectedScriptTag
-	idx := bytes.Index(body, []byte(tag))
-	if idx < 0 {
-		t.Fatal("runtime script tag not injected into oversized HTML")
+	host := strings.TrimPrefix(up.URL, "http://")
+	cookies := strings.Join(resp.Header.Values("Set-Cookie"), "\n")
+	for _, want := range []string{
+		"proxy_real_protocol=http",
+		"proxy_real_host=" + host,
+	} {
+		if !strings.Contains(cookies, want) {
+			t.Errorf("oversized HTML missing control cookie %q in %q", want, cookies)
+		}
 	}
-	withoutTag := append(append([]byte{}, body[:idx]...), body[idx+len(tag):]...)
-	if !bytes.Equal(withoutTag, original) {
-		t.Fatalf("oversized body corrupted: got %d bytes, want %d", len(withoutTag), len(original))
+	cfg := &Config{ProxyURL: up.URL, TokenPrefix: token}
+	bootstrap := renderInlineBootstrap(cfg, "http", host)
+	snippet := bootstrap + injectedScriptTag
+	idx := bytes.Index(body, []byte(snippet))
+	if idx < 0 {
+		t.Fatal("inline bootstrap and runtime tag not injected into oversized HTML")
+	}
+	if !strings.Contains(string(body), "var proxy_url_prefix = '"+up.URL+token+"'") {
+		t.Fatal("oversized HTML runtime has no proxy_url_prefix context")
+	}
+	withoutSnippet := append(append([]byte{}, body[:idx]...), body[idx+len(snippet):]...)
+	if !bytes.Equal(withoutSnippet, original) {
+		t.Fatalf("oversized body corrupted: got %d bytes, want %d", len(withoutSnippet), len(original))
 	}
 	if !bytes.HasSuffix(body, tail) {
 		t.Fatal("GBK tail bytes were altered")

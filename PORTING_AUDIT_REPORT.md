@@ -5,6 +5,7 @@
 - 对照基线：`netptop/siteproxy` v2.7.11（commit `c39ee16`）
 - 核验方式：源码反混淆比对 + 双实例差分测试 + 现有测试/静态检查
 - 核验结论：核心链路大体完成，但**不属于忠实移植**；存在 4 项未记录的功能缺失，其中 2 项会直接影响真实站点
+- 轮次说明：第一轮见 §1-§9，第二轮见 §10，第三轮见 §11-§12，第四轮见 §13（P-30…P-36）与 §14 修复记录，第五轮见 §15（P-37…P-40）与 §16 修复记录
 
 ---
 
@@ -112,7 +113,7 @@ go build -o /tmp/diff/siteproxy-go .
 - 判断函数：`_0x461d75`，第 2111 行。
 - 命中后跳过整个 URL 重写分支：第 2402 行。
 
-也就是说，原版对 Telegram Web 页面**不做任何 href/src/srcset/style url() 等 URL 重写**，只做标识符重写和 integrity 清理。
+也就是说，原版对 Telegram Web 页面**不做任何 href/src/srcset/style url() 等 URL 重写**；§14 复核进一步确认，HTML 分支连标识符重写和 integrity 清理也不做。
 
 **当前实现**
 
@@ -566,7 +567,7 @@ mock 对以下路径返回 200：
 
 | 编号 | 状态 | 说明 |
 | --- | --- | --- |
-| P-01 Telegram 豁免 | 已修复 | `rewriteHTMLForHost` 跳过 URL 重写，保留标识符/integrity 处理 |
+| P-01 Telegram 豁免 | 已修复；§14 再修正 | `rewriteHTMLForHost` 对 Telegram 走独立分支，跳过 URL/标识符/integrity/CSP 处理 |
 | P-02 Google integrity | 已修复 | 内联赋值在脚本抽取前删除 |
 | P-03 路径内 token | 已修复 | `targetFromPathToken` 支持 `/foo/{token}/http/host/x` 与二次 token |
 | P-04 query 还原 | 已修复 | 且已改为只还原第一个匹配，与上游 `String.replace` 一致 |
@@ -822,3 +823,475 @@ go build -o /tmp/diff/siteproxy-go .
 
 - `Connection` 命名的普通请求头仍按 Go 当前实现转发；原版 Node fetch 的运行时拒绝边界没有完全模拟，已在 README 明确披露。
 - P-15/P-16/P-17（额外 charset meta）/P-18 等第一轮已确认的设计差异保持不变。
+
+---
+
+## 13. 第四轮深度对比（2026-11-17 下午）
+
+本轮继续使用 Node v2.7.11（:5606）与当前 Go 构建（:5607，commit `dd33531`）做逐请求差分，
+并额外启动三个临时上游验证边角：Telegram HTML（:5702）、17 MiB HTML（:5703）、Google 外部 JS（:5704）。
+上游仍以 `/tmp/deob/deobfuscated.js`、`/tmp/deob/injected/deobfuscated.js` 和
+`/tmp/deob/sw/deobfuscated.js` 为证据。本轮只做审查，未修改实现。
+
+### 13.1 新增发现
+
+以下问题已在 §14 修复，本节保留审查时状态。
+
+| 编号 | 级别 | 类型 | 结论 |
+| --- | --- | --- | --- |
+| P-30 | 中低 | 特殊站点重写 | Telegram HTML 的上游分支会跳过整个 `_0x531801`；Go 仍执行内联脚本标识符重写、`integrity`/`crossorigin` 删除，并把 CSS `@charset` 改为 UTF-8 |
+| P-31 | 中 | 目标主机兼容 | `isPlausibleHost` 拒绝非 ASCII / 百分号编码的 IDN 主机；浏览器把一个 Unicode 域名链接编码成 `%E4...` 后，Go 直接 404，Node 仍会尝试抓取（502 而非 404） |
+| P-32 | 中低 | 超大 HTML | 超过 16 MiB 的 HTML 只注入外部 `siteproxy-response-injected.js`，没有注入 inline bootstrap；外部脚本读取不到 `proxy_url_prefix` / token / 目标 host，客户端运行时实际失效 |
+| P-33 | 低 | 静态资源路由 | Node 对所有以 `siteproxy-response-injected.js` 结尾的路径返回脚本，Go 只匹配根路径和 base path；Node 使用 `no-cache, no-store, must-revalidate`，Go 只发 `no-cache` |
+| P-34 | 低 | 文档/损坏压缩 | README 声称“损坏 gzip 原样透传”，但只覆盖 `gzip.NewReader` 构造失败；gzip 头合法、正文损坏时 Go 返回 502，Node 返回 500 |
+| P-35 | 低 | Google 外部 JS | `renderJS` 对 Google 外部 JS 也执行 `stripGoogleIntegrityAssignments`；上游对 JS 走 `skipUrlRewrite=true`，不会做这项替换 |
+| P-36 | 低 | Service Worker | 客户端已发送 `siteproxy-target-protocol/host` 和 `siteproxy-real-referer`，但当前 SW 完全不读取这些头；上游 SW 在 URL 不在 token scope 时用它们恢复目标站点 |
+
+### 13.2 关键证据与复现
+
+**P-30 Telegram HTML**
+
+上游 `_0x4b0bf2` 在 `_0x430b91(host)` 为真（Telegram）时走专用分支，只做字符集处理、
+注入和 JS 文件标识符重写，不调用 `_0x531801`；因此 HTML 内的内联脚本、`integrity`、
+`crossorigin` 都不改。当前 `rewriteHTMLForHost` 只在 URL 重写步骤前判断
+`skipURLRewriteForHost`，之后的 `restoreScriptBodies`、`scriptOrLinkTagRe` 仍会执行。
+
+临时上游返回：
+
+```html
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'">
+<script>window.location.href='/x'; navigator.serviceWorker.register('/sw');</script>
+<script integrity="sha256-x" crossorigin="anonymous" src="https://example.com/s.js"></script>
+```
+
+请求 `telegram.org.127.0.0.1.nip.io:5702/x`：
+
+| 内容 | Node :5606 | Go :5607 |
+| --- | --- | --- |
+| 内联脚本 | `window.location.href` / `navigator.serviceWorker` 原样 | 改为 `window.___location.href` / `navigator.___serviceWorker` |
+| 外部 script | `integrity`、`crossorigin` 保留 | 两者均删除 |
+| meta CSP | 保留 | 删除 |
+
+**P-31 IDN 主机**
+
+`ParseTarget` 使用 `isPlausibleHost`（`当前工作区/server.go:331`），后者只接受
+ASCII 字母数字、`.`、`-`、`_` 和数字端口；`RewriteURL` 却会把 Unicode 主机原样写进代理路径。
+直接请求：
+
+```text
+/user22334455/https/例え.テスト/
+```
+
+| Node :5606 | Go :5607 |
+| --- | --- |
+| 502（已进入抓取阶段） | 404（路由阶段拒绝） |
+
+这说明 Go 对 IDN 链接的失败发生在路由层，而不是上游 DNS。需要 IDNA ToASCII 转换，
+或在 `RewriteURL` 阶段把主机编码为 punycode。
+
+**P-32 超大 HTML**
+
+`当前工作区/proxy.go:466` 的 truncated 分支：
+
+```go
+out = injectSnippetBytes(out, injectedScriptTagAt(p.cfg.BasePath()))
+```
+
+只插入外部脚本。对 17 MiB HTML 差分：
+
+| 指标 | Node :5606 | Go :5607 |
+| --- | --- | --- |
+| inline `proxy_url_prefix` 出现次数 | 2 | 0 |
+| 外部 runtime 标签次数 | 1 | 1 |
+
+外部 `injected.tmpl.js` 依赖 inline bootstrap 定义
+`config_proxy_url` / `config_token_prefix` / `proxy_real_protocol` / `proxy_real_host`
+（`当前工作区/assets/injected.tmpl.js:40`）；没有 inline 时这些值全部回退为空，
+`proxyRewrite` 无法生成正确的 token 路径。`TestOversizedGBKHTMLKeepsCharsetAndInjectsRuntime`
+只检查外部标签存在，因此没有覆盖这个问题。
+
+**P-33 静态资源路由与缓存**
+
+| 请求 | Node :5606 | Go :5607 |
+| --- | --- | --- |
+| `/siteproxy-response-injected.js` | 200，`Cache-Control: no-cache, no-store, must-revalidate` | 200，`Cache-Control: no-cache` |
+| `/foo/siteproxy-response-injected.js` | 200 | 404 |
+| `/{token}/foo/siteproxy-response-injected.js` | 200 | 404 |
+
+上游在中间件中直接判断 `req.path.endsWith("siteproxy-response-injected.js")`；
+当前 Go 路由只匹配精确路径及 base path（`当前工作区/server.go:110`、`:137`），
+`serveStaticJS` 的缓存头也只有 `no-cache`（`当前工作区/server.go:483`）。
+这会让旧缓存或非标准路径下的 runtime 请求落到目标站点或 404。
+
+**P-34 头合法但正文损坏的 gzip**
+
+mock `/badgzip` 返回合法的 gzip 头（`1f 8b 08 ...`）加垃圾正文：
+
+| Node :5606 | Go :5607 |
+| --- | --- |
+| 500 Internal Server Error | 502 Proxy fetch error |
+
+`TestCorruptGzipPassesThroughWithoutHang` 使用 `"notgzip"`，只覆盖
+`gzip.NewReader` 构造失败；构造成功后 `io.ReadAll` 报错时，当前 `renderHTML` 返回错误并由
+`writeResponse` 转成 502，不会走 README 所说的“回放已消费字节后原样透传”。
+README 需要缩小该承诺，或实现读取阶段失败时的整段回放。
+
+**P-35 Google 外部 JS**
+
+临时上游返回 `application/javascript`：
+
+```js
+var s=document.createElement('script');s.integrity='sha256-abc';console.log('x');
+```
+
+请求 `google.com.127.0.0.1.nip.io:5704/js`：
+
+| Node :5606 | Go :5607 |
+| --- | --- |
+| 保留 `s.integrity='sha256-abc'` | 删除该赋值 |
+
+上游 `_0x531801` 在 JS 分支以 `skipUrlRewrite=true` 调用，因此 Google 替换表不执行；
+当前 `当前工作区/proxy.go:662` 的 `renderJS` 无条件调用
+`stripGoogleIntegrityAssignments`。这会改动并非 SRI 失效原因的外部脚本。
+
+**P-36 Service Worker 未消费 target 头**
+
+上游 SW 在目标 URL 不在 token scope 时执行（`/tmp/deob/sw/deobfuscated.js:254-258`）：
+
+```js
+_x = headers.get("siteproxy-target-protocol");
+host = headers.get("siteproxy-target-host");
+referer = headers.get("siteproxy-real-referer");
+```
+
+当前 `当前工作区/assets/service-worker.tmpl.js` 没有这三个字符串；它只用
+`event.clientId` 的 URL 和 referer，再回落到 `PROXY_CUR_LOCATION`。客户端在
+`当前工作区/assets/injected.tmpl.js:603` 已经发送这些头，但 SW 侧没有对应分支，
+因此 client URL 和 referer 都不可用时，目标站点上下文会保持旧值或为空。
+
+### 13.3 仍未关闭的历史项
+
+以下不是本轮新发现，但第四轮复核仍然存在：
+
+- **P-06 剩余**：客户端仍未实现目标根路径缺尾斜杠自动补齐和 Bing `#b_content`
+  可见性修复；上游位置为 `/tmp/deob/injected/deobfuscated.js:1484-1509`。
+- **普通 `/{token}/` 根路径**：Node 302 到 `/{token}/https/www.netptop.com`，Go 返回本地首页；
+  README 已将其描述为有意差异，但严格移植标准下仍是行为差。
+- **OPTIONS / GET 请求体**：报告 §9 已记录，但 README 差异列表仍未完整列出。
+- **硬编码黑名单**、**SW v3/v4 鉴权**、**P-15/P-16/P-17/P-18** 保持既有的有意差异。
+
+### 13.4 建议优先级
+
+1. **P-31 IDN 主机**：这是真实可达性缺陷，浏览器生成的 IDN 链接在 Go 上全部 404。
+2. **P-30 Telegram HTML**：按上游对 Telegram 完全跳过 `_0x531801`，仅保留字符集和注入；
+   否则 Telegram Web 的内联脚本和 SRI/安全头被无关地改写。
+3. **P-32 超大 HTML**：要么注入压缩后的 inline bootstrap 配置，要么明确不注入外部 runtime；
+   当前“只注入外部脚本”的状态会让运行时读到空配置。
+4. **P-36 SW target 头**：补齐上游分支，否则新加的客户端头是死代码。
+5. P-33 / P-34 / P-35：低风险路由、缓存和文档/特殊主机问题，可与相应测试一起修正。
+
+### 13.5 质量门禁
+
+```bash
+cd /workspace
+go test ./...
+go vet ./...
+go build -o /tmp/diff/siteproxy-go .
+```
+
+结果：测试通过，vet 无输出，构建成功；本轮未修改代码，因此没有新增测试或提交。
+
+---
+
+## 14. 第四轮修复记录（2026-11-17 下午）
+
+P-30 至 P-36 已修复，未改变此前已关闭的设计差异。质量门禁：
+
+```bash
+cd /workspace
+gofmt -w server.go urlmap.go proxy.go rewrite.go assets.go \
+  audit6_test.go audit_fixes_test.go medium_priority_test.go
+node --check assets/injected.tmpl.js
+node --check assets/service-worker.tmpl.js
+go test ./...
+go vet ./...
+go build -o /tmp/diff/siteproxy-go .
+```
+
+结果：测试通过，vet 无输出，构建成功。
+
+### 14.1 P-30 Telegram 特殊分支
+
+- `rewriteHTMLForHost` 在 `skipURLRewriteForHost(targetHost)` 时直接走专用分支：只做字符集 meta 规范化
+  和注入，不再提取/恢复内联脚本、不再删除 `integrity`/`crossorigin`、不再删除 meta CSP。
+- `renderCSS` 对 Telegram 先返回原始 CSS，不再改写 `@charset` 或 `url()`。
+- 实测 Node :5606 与 Go :5607 对同一 Telegram HTML：`window.location.href`、`navigator.serviceWorker`、
+  `integrity`、`crossorigin` 均保持原样。
+
+### 14.2 P-31 IDN 目标主机
+
+- 新增 `normalizeTargetHost`：对原始 Unicode 和百分号编码的 UTF-8 主机先做路径解码，拒绝解码后出现的
+  `/ \ ? # @`、空白和 NUL，再通过 `golang.org/x/net/idna` 转为 punycode；ASCII 主机保留原有严格校验。
+- `ParseTarget`、`repairOutOfScope`、`unrewriteReferer`、`serveServiceWorker` 统一使用规范化后的主机。
+- 新增 `golang.org/x/net v0.34.0` 依赖。
+- 实测 `/user22334455/https/例え.テスト/`：Node 502、Go 502，Go 不再提前返回 404；
+  新增 `TestIDNTargetHostIsNormalized` 覆盖原始/百分号编码、`UnrewriteURLWithBase` 和 `%2F` 注入拒绝。
+
+### 14.3 P-32 超大 HTML 的 inline bootstrap
+
+- `writeResponse` 的 truncated 分支现在注入 `renderInlineBootstrap(...) + injectedScriptTagAt(...)`，
+  而不是只有外部脚本；`jsEscape` 新增非 ASCII 转义，保证超大 GBK 文档里的 bootstrap 仍是 ASCII。
+- `TestOversizedGBKHTMLKeepsCharsetAndInjectsRuntime` 改为检查 inline bootstrap 和
+  `proxy_url_prefix` 配置，并移除整段注入后逐字节比较原 GBK 正文。
+
+### 14.4 P-33 运行时脚本路由与缓存
+
+- `serve` 在 base-path 检查前匹配任意以 `/siteproxy-response-injected.js` 结尾的路径，
+  与上游 `req.path.endsWith(...)` 一致。
+- `serveStaticJS` 统一返回 `Cache-Control: no-cache, no-store, must-revalidate`。
+- 新增 `TestInjectedRuntimeSuffixAndCacheControl`。
+
+### 14.5 P-34 头合法但正文损坏的 gzip
+
+- `writeResponse` 保留构造解码器时的 `recordingReader`；当读取阶段失败时，用原始头
+  （含 `Content-Encoding`/`Content-Length`）重放 `rec.buf + resp.Body`，不再返回 502。
+- 新增 `TestCorruptGzipWithValidHeaderIsReplayed`；原有 `"notgzip"` 构造失败用例继续通过。
+- README 的“损坏 gzip 原样透传”现在对两类损坏都成立。
+
+### 14.6 P-35 Google 外部 JS
+
+- `renderJS` 不再调用 `stripGoogleIntegrityAssignments`；Google SRI 清理只保留在 HTML 分支。
+- 新增 `TestGoogleExternalJSIntegrityIsPreserved`；实测 Node 与 Go 对 `google.com` 外部 JS
+  都保留 `s.integrity='sha256-abc'`。
+
+### 14.7 P-36 Service Worker target 头
+
+- `assets/service-worker.tmpl.js` 在 client URL/referer 都没有提供上下文时，读取
+  `siteproxy-target-host` / `siteproxy-target-protocol`，并用 `siteproxy-real-referer` 设置
+  `siteproxy-newreferer`；只对 proxy-origin 且不在 token scope 的请求生效。
+- 新增 `TestServiceWorkerConsumesTargetHeaders` 检查脚本包含对应分支和字段。
+
+### 14.8 本轮修改文件
+
+- `server.go`、`urlmap.go`、`proxy.go`、`rewrite.go`、`assets.go`
+- `assets/service-worker.tmpl.js`
+- `audit6_test.go`、`audit_fixes_test.go`、`medium_priority_test.go`
+- `README.md`
+- `go.mod`、`go.sum`
+
+---
+
+## 15. 第五轮深度对比审查（2026-11-17 下午）
+
+本轮继续使用 Node v2.7.11（:5606）与当前 Go 构建（:5607），并临时启动：
+
+- 17 MiB HTML 上游 :5703；
+- 带 `blocked_sites` 的 Go 实例 :5617（`/tmp/diff/go-blockidn.json`）。
+
+上游证据仍为 `/tmp/deob/deobfuscated.js`、`/tmp/deob/sw/deobfuscated.js`。
+本轮只审查，不修改实现。
+
+### 15.1 新增发现
+
+| 编号 | 级别 | 类型 | 结论 |
+| --- | --- | --- | --- |
+| P-37 | 中 | 超大响应 | 超过 16 MiB 的 HTML/CSS/JS 在 truncated 分支直接返回，没有追加 `proxy_real_protocol` / `proxy_real_host` 控制 Cookie；Node 会追加，导致超大页面的越界请求修复和 SW 上下文缺失 |
+| P-38 | 中低 | Service Worker 端点 | 上游 `_0x75fef1` 在缺少 `proxy_real_host` 时返回 404；Go 在 token 正确但 host 缺失时返回 200，并从任意 Referer 路径回填目标 host |
+| P-39 | 中低 | 黑名单与 IDN | P-31 把目标 host 规范化为 punycode，但 `blocked_sites` 条目没有做同样的 IDNA 规范化；配置 Unicode 域名时黑名单被绕过 |
+| P-40 | 低 | Service Worker 上下文 | P-36 只在 client/referer 都未提供上下文时读取 `siteproxy-target-*`；上游在同一源越界请求上即使已有 client/referer，也会用 `siteproxy-real-referer` 覆盖 `siteproxy-newreferer`，当前 Go 会丢失实际页面 Referer |
+
+### 15.2 证据与复现
+
+**P-37 超大响应缺少控制 Cookie**
+
+17 MiB HTML 上游 :5703 返回 `text/html`。请求：
+
+```bash
+curl -sS -D - -o /dev/null \
+  'http://127.0.0.1:5606/user22334455/http/127.0.0.1:5703/'
+curl -sS -D - -o /dev/null \
+  'http://127.0.0.1:5607/user22334455/http/127.0.0.1:5703/'
+```
+
+| 响应 | Node :5606 | Go :5607 |
+| --- | --- | --- |
+| 状态 | 200 | 200 |
+| `Set-Cookie` | `proxy_real_protocol=http`、`proxy_real_host=127.0.0.1:5703` | 无 |
+| `Content-Length` | 17828516 | 无（chunked） |
+
+`当前工作区/proxy.go:488-529` 的 truncated 分支在 `addControlCookies` 之前
+`return`。同一分支也覆盖超大 CSS/JS。P-32 修复只补了 inline bootstrap，
+没有补控制 Cookie。
+
+**P-38 SW 端点缺少 host 校验**
+
+上游 `_0x75fef1` 在 `proxy_real_host` 缺失时直接 `return _0x5e17e8()`
+（交给后续处理器，最终 404）；Go `serveServiceWorker`
+（`当前工作区/server.go:486-516`）只校验 token，host 为空仍渲染 SW：
+
+```bash
+curl -sS -D - -o /dev/null \
+  'http://127.0.0.1:5607/siteproxy_service_worker.js?token_prefix=/user22334455/&proxy_real_protocol=https'
+# Go: 200, SW 内 proxy_real_host: ""
+
+curl -sS -H 'Referer: http://evil.test/user22334455/http/evil.test/x' \
+  'http://127.0.0.1:5607/siteproxy_service_worker.js?token_prefix=/user22334455/'
+# Go: 200，proxy_real_host 被回填为 evil.test
+# Node 相同请求：404
+```
+
+实测还显示 Node 对 host 缺失请求返回 404，而 Go 返回 200。回填路径
+`targetFromProxiedURL(ref, ...)` 没有像 `repairOutOfScope` 那样校验
+Referer 是否以 `{proxy_url}{token_prefix}` 开头。
+
+**P-39 IDN 黑名单绕过**
+
+启动配置（`/tmp/diff/go-blockidn.json`）：
+
+```json
+{
+  "proxy_url": "http://proxy.test",
+  "token_prefix": "/user22334455/",
+  "local_listen_port": 5617,
+  "blocked_sites": ["127.0.0.1", "例え.テスト"]
+}
+```
+
+请求结果：
+
+| 请求 | 状态 |
+| --- | --- |
+| `/user22334455/http/127.0.0.1:5701/` | 403（命中） |
+| `/user22334455/http/例え.テスト/` | 502（未命中，进入 DNS） |
+| `/user22334455/http/xn--r8jz45g.xn--zckzah/` | 502（未命中） |
+
+`normalizeTargetHost`（`当前工作区/server.go:346-416`）把目标 host 转成
+punycode；`Config.IsBlocked`（`当前工作区/config.go:181-192`）只做
+`strings.ToLower`，没有对 `BlockedSites` 条目做 IDNA 规范化。配置写
+Unicode 域名时，`host == b` 和 `strings.HasSuffix(host, "."+b)` 都不会命中。
+
+**P-40 SW target 头只在 contextKnown=false 时生效**
+
+上游 SW 的 target-header 分支位于同源越界请求的 `else if`
+（`/tmp/deob/sw/deobfuscated.js:254-258`），即使 client URL 或 referer
+已经给出 siteHost，也会用 `siteproxy-real-referer` 覆盖
+`siteproxy-newreferer`。当前 `当前工作区/assets/service-worker.tmpl.js:161-180`
+用 `!contextKnown` 限制该分支，因此 client/referer 可用时不会读取
+`siteproxy-real-referer`；后续 `siteReferer` 为空，只会发送
+target origin 作为 `siteproxy-newreferer`。对检查完整 Referer 的上游站点，
+Go 会发送 `https://target` 而不是实际页面 URL。
+
+另外，上游该分支使用 `pathname.includes(config_token_prefix)`，当前 Go
+使用 `pathInScope`（要求 base path 后以 token 开头），在路径中间出现 token
+的极少数情况下判定不同。
+
+### 15.3 其他低风险观察
+
+- `serveStaticJS`（`当前工作区/server.go:553-558`）返回
+  `application/javascript; charset=UTF-8` 和 `Service-Worker-Allowed`；
+  实测 Node runtime 为 `text/plain; charset=UTF-8`，Node SW 为
+  `application/javascript` 且没有 `Service-Worker-Allowed`。浏览器可执行，
+  但响应头不是严格等价。
+- Go 的 404 使用 `http.NotFound`，实测 body 为 `404 page not found` 且带
+  `X-Content-Type-Options: nosniff`；Node 为 `404 Not Found`。仅影响错误页细节。
+- `validPort`（`当前工作区/server.go:442-447`）使用 `strconv.Atoi`，会接受
+  `+80` 这类端口写法；构造上游 URL 时通常只会得到 400/502，属于输入校验边角。
+
+### 15.4 建议优先级
+
+1. **P-37**：在 truncated 分支 `WriteHeader` 前调用 `addControlCookies`；
+   这是超大页面会话上下文缺失的真实功能问题。
+2. **P-39**：在配置加载时对 `blocked_sites` 的非路径条目执行
+   `normalizeTargetHost`/IDNA，或同时用 punycode 匹配。
+3. **P-38**：缺少 `proxy_real_host` 时按上游返回 404；若保留 Referer
+   回填，必须先校验 Referer 属于 `{proxy_url}{token_prefix}`。
+4. **P-40**：按上游在 contextKnown=true 且同源越界的 else-if 中继续消费
+   `siteproxy-real-referer`，并确认 `pathInScope` 与 `includes` 的边界。
+5. 其余为低风险响应头/错误页细节，可与下一轮一起处理。
+
+### 15.5 质量门禁
+
+本轮未修改代码，现有测试仍通过：
+
+```bash
+cd /workspace
+go test ./...
+go vet ./...
+go build -o /tmp/diff/siteproxy-go .
+```
+
+结果：测试通过，vet 无输出，构建成功。第五节发现已在 §16 修复。
+
+---
+
+## 16. 第五轮修复记录（2026-11-17 下午）
+
+P-37 至 P-40 已修复，P-15/P-16/P-17/P-18/P-05 等已披露的有意差异保持不变。
+
+### 16.1 P-37 超大文本响应补控制 Cookie
+
+- `writeResponse` 的 truncated 分支在 `WriteHeader` 前调用
+  `addControlCookies`（`当前工作区/proxy.go:495`），HTML/CSS/JS 超限原样转发时
+  也会设置 `proxy_real_protocol` / `proxy_real_host`。
+- `addControlCookies` 的注释同步改为“被重写或超限转发的文本响应”。
+- `TestOversizedGBKHTMLKeepsCharsetAndInjectsRuntime` 增加两枚控制 Cookie 断言。
+
+### 16.2 P-39 blocked_sites 的 IDNA 规范化
+
+- 新增 `normalizeBlockedEntry`（`当前工作区/config.go:182`）：非路径条目先转小写、
+  去除尾部点，再复用 `normalizeTargetHost` 转 punycode，并用 `hostWithoutPort`
+  去掉端口；路径条目保持原样。
+- `Config.IsBlocked`（`当前工作区/config.go:197`）也会规范化传入 host，因此直接调用
+  `IsBlocked("例え.テスト")` 与传入 punycode 的结果一致。
+- 新增 `TestBlockedSitesUnicodeIsNormalized`，覆盖 Unicode 配置、子域名、
+  大小写/尾部点、端口和路径条目。
+
+### 16.3 P-38 Service Worker 缺少 host 时返回 404
+
+- `serveServiceWorker`（`当前工作区/server.go:489`）先校验 token，再对
+  `proxy_real_host` 执行 `normalizeTargetHost`；缺失或非法 host 直接
+  `http.NotFound`，不再从 Referer 回填，和上游 `_0x75fef1` 一致。
+- 新增 `TestServiceWorkerRequiresValidTargetHost`，覆盖缺失 host、非法 host、
+  仅 Referer、合法 host 四种请求。
+
+### 16.4 P-40 Service Worker target 头不再依赖 contextKnown
+
+- 删除 `contextKnown`；target-header 分支改为同源越界修复的 `else-if`
+  （`当前工作区/assets/service-worker.tmpl.js:185`），client URL 或 Referer 已给出
+  上下文时仍会消费 `siteproxy-target-*` 并用 `siteproxy-real-referer` 覆盖
+  `siteproxy-newreferer`。
+- 分支内的 token 判断改为上游的 `!url.pathname.includes(TOKEN_PREFIX)`。
+- `TestServiceWorkerConsumesTargetHeaders` 更新为检查新分支，并断言不再出现
+  `contextKnown`。
+
+### 16.5 本轮修改文件
+
+- `config.go`、`server.go`、`proxy.go`
+- `assets/service-worker.tmpl.js`
+- `audit6_test.go`、`audit7_test.go`、`medium_priority_test.go`
+- `README.md`
+
+### 16.6 质量门禁
+
+```bash
+cd /workspace
+gofmt -l config.go server.go proxy.go audit6_test.go audit7_test.go medium_priority_test.go
+node --check assets/service-worker.tmpl.js
+go test ./...
+go vet ./...
+go build -o /tmp/diff/siteproxy-go .
+```
+
+结果：`gofmt -l` 无输出，`node --check` 通过，测试通过，vet 无输出，构建成功。
+
+实测新构建：
+
+- 17 MiB HTML 经 `:5607` 返回 200，并带上 `proxy_real_protocol=http` 与
+  `proxy_real_host=127.0.0.1:5703` 两枚控制 Cookie。
+- 临时实例 `:5617` 配置 `blocked_sites:["127.0.0.1","例え.テスト"]` 后，
+  ASCII 与 Unicode 目标均返回 403。
+- SW 缺少 host 返回 404，合法 host 返回 200；返回脚本中 `contextKnown` 为 0 次，
+  `pathname.includes(TOKEN_PREFIX)` 存在。
+
+§15.3 中 `serveStaticJS` 响应头、404 错误页文案和 `validPort("+80")` 仍属于低风险
+差异，未在本轮改动。

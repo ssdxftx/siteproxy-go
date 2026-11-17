@@ -144,8 +144,7 @@ func (c *Config) normalize() (*Config, error) {
 
 	blocked := make(map[string]bool, len(c.BlockedSites))
 	for _, s := range c.BlockedSites {
-		s = strings.ToLower(strings.TrimSpace(s))
-		if s != "" {
+		if s = normalizeBlockedEntry(s); s != "" {
 			blocked[s] = true
 		}
 	}
@@ -175,12 +174,32 @@ func normalizeTokenPrefix(p string) string {
 	return p
 }
 
+// normalizeBlockedEntry canonicalises a blocked_sites entry the same way a
+// target host is canonicalised. Unicode domain entries therefore become
+// punycode and match the normalized target host; path-style entries keep their
+// upstream substring semantics. Ports are dropped because IsBlocked compares
+// hostnames without ports.
+func normalizeBlockedEntry(entry string) string {
+	entry = strings.ToLower(strings.TrimSpace(entry))
+	if entry == "" || strings.Contains(entry, "/") {
+		return entry
+	}
+	entry = strings.TrimSuffix(entry, ".")
+	if host, ok := normalizeTargetHost(entry); ok {
+		return strings.TrimSuffix(hostWithoutPort(host), ".")
+	}
+	return entry
+}
+
 // IsBlocked reports whether host matches (or is a subdomain of) any blocked
 // domain entry. Path-style entries (containing "/") are matched by
 // IsBlockedURL instead, mirroring the upstream substring semantics.
 func (c *Config) IsBlocked(host string) bool {
 	host = hostWithoutPort(strings.ToLower(host))
 	host = strings.TrimSuffix(host, ".")
+	if normalized, ok := normalizeTargetHost(host); ok {
+		host = strings.TrimSuffix(hostWithoutPort(normalized), ".")
+	}
 	for _, b := range c.BlockedSites {
 		if strings.Contains(b, "/") {
 			continue

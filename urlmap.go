@@ -48,8 +48,8 @@ func ParseTarget(path, rawQuery string) *TargetInfo {
 	if m == nil {
 		return nil
 	}
-	host := m[2]
-	if !isPlausibleHost(host) {
+	host, ok := normalizeTargetHost(m[2])
+	if !ok {
 		return nil
 	}
 	rest := m[3]

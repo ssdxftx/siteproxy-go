@@ -89,5 +89,26 @@ func jsEscape(s string) string {
 	s = strings.ReplaceAll(s, "\u2028", `\u2028`)
 	s = strings.ReplaceAll(s, "\u2029", `\u2029`)
 	s = strings.ReplaceAll(s, "</", `<\/`)
-	return s
+	return escapeNonASCII(s)
+}
+
+// escapeNonASCII keeps the injected bootstrap valid in non-UTF-8 documents
+// (for example an oversized GBK page) by emitting UTF-16 escapes instead of
+// raw multi-byte bytes.
+func escapeNonASCII(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case r <= 0x7F:
+			b.WriteRune(r)
+		case r <= 0xFFFF:
+			fmt.Fprintf(&b, `\u%04X`, r)
+		default:
+			r -= 0x10000
+			hi := 0xD800 + (r >> 10)
+			lo := 0xDC00 + (r & 0x3FF)
+			fmt.Fprintf(&b, `\u%04X\u%04X`, hi, lo)
+		}
+	}
+	return b.String()
 }

@@ -6,3 +6,5 @@ require (
 	github.com/andybalholm/brotli v1.2.7
 	golang.org/x/text v0.43.0
 )
+
+require golang.org/x/net v0.34.0

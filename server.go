@@ -6,9 +6,12 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"runtime/debug"
 	"strconv"
 	"strings"
+
+	"golang.org/x/net/idna"
 )
 
 // Server is the top level HTTP handler implementing the siteproxy routing:
@@ -94,6 +97,15 @@ func (p *panicRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.EscapedPath()
 
+	// Upstream serves the client runtime for any path ending in this name,
+	// not just the root/base-path spelling. Keep that behaviour so a page
+	// that asks for an in-scope copy (or an old cached URL shape) still gets
+	// the runtime instead of a 404 or the target site's file.
+	if strings.HasSuffix(path, "/siteproxy-response-injected.js") {
+		s.serveInjectedScript(w, r)
+		return
+	}
+
 	// A proxy mounted under a base path (proxy_url = https://host/sub) only
 	// serves URLs inside that prefix. Without this guard the same proxy is
 	// reachable both as /sub/{token}/... and /{token}/..., which breaks path
@@ -106,11 +118,6 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	switch path {
 	case "/", "/index.html", "/index.htm":
 		s.serveHomepage(w, r)
-		return
-	case "/siteproxy-response-injected.js":
-		// Static asset: it reads its per-page context from the inline
-		// bootstrap globals, never from a baked-in config.
-		s.serveInjectedScript(w, r)
 		return
 	case "/siteproxy_service_worker.js":
 		// Rendered with the registration context. The registration URL must
@@ -133,9 +140,6 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	switch proxyPath {
 	case "/", "/index.html", "/index.htm":
 		s.serveHomepage(w, r)
-		return
-	case "/siteproxy-response-injected.js":
-		s.serveInjectedScript(w, r)
 		return
 	case "/siteproxy_service_worker.js":
 		s.serveServiceWorker(w, r)
@@ -318,47 +322,109 @@ func (s *Server) repairOutOfScope(r *http.Request) *TargetInfo {
 	// arbitrary proxy_real_host. Validate it exactly like ParseTarget
 	// does before it may be used as an upstream host (no userinfo
 	// smuggle, no whitespace, plausible hostname shape).
-	if !isPlausibleHost(host) {
+	normalizedHost, ok := normalizeTargetHost(host)
+	if !ok {
 		return nil
 	}
-	return &TargetInfo{Protocol: proto, Host: host, Path: path, RawQuery: r.URL.RawQuery}
+	return &TargetInfo{Protocol: proto, Host: normalizedHost, Path: path, RawQuery: r.URL.RawQuery}
 }
 
 // isPlausibleHost validates a target host before it is used to build an
-// upstream URL or a control-cookie repair. It accepts DNS names, IPv4 and
-// bracketed IPv6 literals with an optional numeric port. Short/intranet
-// hostnames (localhost, router) remain valid targets.
+// upstream URL or a control-cookie repair. It accepts DNS names, IPv4,
+// bracketed IPv6 literals and IDN labels (converted to punycode), with an
+// optional numeric port. Short/intranet hostnames (localhost, router) remain
+// valid targets.
 func isPlausibleHost(host string) bool {
-	if host == "" || len(host) > 253 {
-		return false
+	_, ok := normalizeTargetHost(host)
+	return ok
+}
+
+// normalizeTargetHost validates a target host and returns its canonical
+// upstream form. Non-ASCII labels and percent-encoded UTF-8 labels (the shape
+// a browser sends in a path) are converted to ASCII IDNA/punycode, so an
+// internationalized domain does not turn into a routing 404.
+func normalizeTargetHost(host string) (string, bool) {
+	if host == "" {
+		return "", false
+	}
+	if strings.Contains(host, "%") {
+		decoded, err := url.PathUnescape(host)
+		if err != nil {
+			return "", false
+		}
+		host = decoded
+	}
+	if len(host) > 253 {
+		return "", false
 	}
 	if strings.ContainsAny(host, "/\\?#@ \t\r\n\v\f\x00") {
-		return false
+		return "", false
 	}
 	if strings.HasPrefix(host, "[") {
 		end := strings.IndexByte(host, ']')
 		if end < 0 {
-			return false
+			return "", false
 		}
 		if net.ParseIP(host[1:end]) == nil {
-			return false
+			return "", false
 		}
 		rest := host[end+1:]
 		if rest == "" {
-			return true
+			return host, true
 		}
 		if !strings.HasPrefix(rest, ":") {
-			return false
+			return "", false
 		}
-		return validPort(rest[1:])
+		if !validPort(rest[1:]) {
+			return "", false
+		}
+		return host, true
 	}
 	name := host
+	port := ""
 	if i := strings.LastIndexByte(host, ':'); i >= 0 {
+		if strings.Count(host, ":") != 1 {
+			return "", false
+		}
 		name = host[:i]
-		if !validPort(host[i+1:]) {
+		port = host[i+1:]
+		if !validPort(port) {
+			return "", false
+		}
+	}
+	if name == "" {
+		return "", false
+	}
+	ascii := name
+	if !isASCIIHostName(name) {
+		converted, err := idna.ToASCII(name)
+		if err != nil || converted == "" {
+			return "", false
+		}
+		ascii = converted
+	}
+	if !isValidASCIIHostName(ascii) {
+		return "", false
+	}
+	if len(ascii) > 253 {
+		return "", false
+	}
+	if port != "" {
+		return ascii + ":" + port, true
+	}
+	return ascii, true
+}
+
+func isASCIIHostName(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 0x80 {
 			return false
 		}
 	}
+	return true
+}
+
+func isValidASCIIHostName(name string) bool {
 	if name == "" {
 		return false
 	}
@@ -417,6 +483,9 @@ func (s *Server) redirectDefaultPassword(w http.ResponseWriter, r *http.Request)
 // configured token_prefix. The token check is what keeps the worker (which
 // necessarily contains the token for path-scope checks) from being fetched
 // anonymously; a bare public request gets a 404 instead of the secret.
+// Upstream also returns 404 when proxy_real_host is missing or invalid instead
+// of falling back to a Referer, so a malformed registration cannot obtain a
+// worker with an empty/attacker-selected target context.
 func (s *Server) serveServiceWorker(w http.ResponseWriter, r *http.Request) {
 	token := r.URL.Query().Get("token_prefix")
 	if token != s.cfg.TokenPrefix {
@@ -424,19 +493,13 @@ func (s *Server) serveServiceWorker(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	proto := r.URL.Query().Get("proxy_real_protocol")
-	host := r.URL.Query().Get("proxy_real_host")
 	if proto != "http" && proto != "https" {
 		proto = "https"
 	}
-	if host != "" && !isPlausibleHost(host) {
-		host = ""
-	}
-	if host == "" {
-		if ref := r.Header.Get("Referer"); ref != "" {
-			if t := targetFromProxiedURL(ref, s.cfg.TokenPrefix, s.cfg.BasePath()); t != nil {
-				proto, host = t.Protocol, t.Host
-			}
-		}
+	host, ok := normalizeTargetHost(r.URL.Query().Get("proxy_real_host"))
+	if !ok {
+		http.NotFound(w, r)
+		return
 	}
 	body, err := renderServiceWorker(s.cfg, proto, host, token)
 	if err != nil {
@@ -482,7 +545,7 @@ func targetFromProxiedURL(u, tokenPrefix, basePath string) *TargetInfo {
 
 func (s *Server) serveStaticJS(w http.ResponseWriter, r *http.Request, body []byte, allowedScope string) {
 	w.Header().Set("Content-Type", "application/javascript; charset=UTF-8")
-	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
 	w.Header().Set("Service-Worker-Allowed", allowedScope)
 	w.Header().Set("Content-Length", fmt.Sprint(len(body)))
 	_, _ = w.Write(body)

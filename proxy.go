@@ -333,7 +333,11 @@ func (p *Proxy) unrewriteReferer(ref string) (string, bool) {
 	if m == nil {
 		return path, true
 	}
-	real := m[1] + "://" + m[2] + m[3]
+	host, ok := normalizeTargetHost(m[2])
+	if !ok {
+		return "", false
+	}
+	real := m[1] + "://" + host + m[3]
 	if query != "" {
 		real += "?" + query
 	}
@@ -355,6 +359,7 @@ func (p *Proxy) writeResponse(w http.ResponseWriter, r *http.Request, resp *http
 	// Redirect bodies and HEAD responses are not forwarded, so there is
 	// nothing to decode for them.
 	var body io.Reader = resp.Body
+	var compressed *recordingReader
 	if needsProcess && !isRedirect && !isHead {
 		if enc := resp.Header.Get("Content-Encoding"); enc != "" && !strings.EqualFold(enc, "identity") {
 			// Record every byte the decoder constructors read. gzip.NewReader
@@ -364,6 +369,7 @@ func (p *Proxy) writeResponse(w http.ResponseWriter, r *http.Request, resp *http
 			// shorter body (the client then waits forever).
 			rec := &recordingReader{r: body}
 			if dec, ok := newDecoderChain(enc, rec); ok {
+				compressed = rec
 				body = io.NopCloser(dec)
 			} else {
 				needsProcess = false
@@ -440,6 +446,22 @@ func (p *Proxy) writeResponse(w http.ResponseWriter, r *http.Request, resp *http
 		out, truncated, renderErr = p.renderJS(resp, body, target)
 	}
 	if renderErr != nil {
+		// A decoder may consume a valid header before hitting a corrupt
+		// compressed stream. When we recorded the original bytes, replay
+		// them verbatim with the original encoding instead of turning a
+		// recoverable upstream response into a 502. The constructor-failure
+		// path above already streams directly and never reaches this branch.
+		if compressed != nil {
+			log.Printf("[siteproxy] upstream %s body decompression failed for %s: %v; replaying original bytes",
+				resp.Header.Get("Content-Encoding"), target.Host, renderErr)
+			clearResponseHeader(outHeader)
+			rewriteResponseHeaders(p.cfg, resp, outHeader, target, false)
+			w.WriteHeader(resp.StatusCode)
+			if _, err := io.Copy(w, io.MultiReader(bytes.NewReader(compressed.buf), resp.Body)); err != nil {
+				log.Printf("[siteproxy] replay original body for %s: %v", target.Host, err)
+			}
+			return
+		}
 		// The upstream body could not be read completely. Do not turn a
 		// broken transfer into a successful 200 with a partial page.
 		log.Printf("[siteproxy] read upstream body for %s: %v", target.Host, renderErr)
@@ -467,6 +489,10 @@ func (p *Proxy) writeResponse(w http.ResponseWriter, r *http.Request, resp *http
 		// Too large to rewrite: forward the decompressed bytes unchanged
 		// instead of silently truncating the page. The decoder may have more
 		// data buffered, so stream the remainder after the already-read part.
+		// The response is still a text response that the client runtime will
+		// see, so it needs the same site-context cookies as a rewritten body;
+		// upstream sets them before its oversized-response early return.
+		p.addControlCookies(outHeader, target)
 		outHeader.Del("Content-Encoding")
 		outHeader.Del("Content-Length")
 		if strings.HasPrefix(ct, "text/html") {
@@ -491,7 +517,12 @@ func (p *Proxy) writeResponse(w http.ResponseWriter, r *http.Request, resp *http
 			// (the tag is pure ASCII, so GBK/Big5 bytes are untouched).
 			// UTF-16 bodies cannot carry an ASCII snippet.
 			if !isUTF16 {
-				out = injectSnippetBytes(out, injectedScriptTagAt(p.cfg.BasePath()))
+				// The external runtime reads its per-page context from the
+				// inline bootstrap. Oversized bodies skip server-side URL
+				// rewriting, so they still need that bootstrap or the client
+				// sees empty proxy_url/token/host and cannot repair requests.
+				bootstrap := renderInlineBootstrap(p.cfg, target.Protocol, target.Host)
+				out = injectSnippetBytes(out, bootstrap+injectedScriptTagAt(p.cfg.BasePath()))
 			}
 		}
 		w.WriteHeader(resp.StatusCode)
@@ -528,9 +559,10 @@ func stripNoBodyHeaders(h http.Header) {
 }
 
 // addControlCookies adds the HttpOnly site-context cookies to responses whose
-// body is actually rewritten (or to text redirects). Empty bodies, 204/304,
-// HEAD and binary streams deliberately do not receive them: upstream does not
-// set them there either, and they would otherwise create phantom session state.
+// text body is rewritten or forwarded oversized (and to text redirects). Empty
+// bodies, 204/304, HEAD and binary streams deliberately do not receive them:
+// upstream does not set them there either, and they would otherwise create
+// phantom session state.
 func (p *Proxy) addControlCookies(h http.Header, target *TargetInfo) {
 	if target == nil {
 		return
@@ -642,14 +674,16 @@ func (p *Proxy) renderCSS(resp *http.Response, body io.Reader, target *TargetInf
 		return raw, false, nil
 	}
 	txt, used := decodeTextBody(raw, resp.Header.Get("Content-Type"))
+	// Telegram CSS follows the upstream dedicated branch: no @charset or URL
+	// rewriting at all.
+	if skipURLRewriteForHost(target.Host) {
+		return txt, false, nil
+	}
 	// Normalise @charset whenever the bytes really are UTF-8, even if the
 	// HTTP header (not the @charset) was what told us so. Leaving a stale
 	// "@charset gbk" in a UTF-8 stylesheet makes the browser re-decode it.
 	if used != "" || utf8.Valid(txt) {
 		txt = rewriteCSSCharset(txt)
-	}
-	if skipURLRewriteForHost(target.Host) {
-		return txt, false, nil
 	}
 	base := p.cfg.ProxyURL + p.cfg.TokenPrefix + target.SitePrefix() + target.Path
 	return []byte(rewriteCSS(string(txt), p.publicPrefix(), base, p.proxyHost())), false, nil
@@ -671,8 +705,9 @@ func (p *Proxy) renderJS(resp *http.Response, body io.Reader, target *TargetInfo
 		return raw, false, nil
 	}
 	txt, _ := decodeTextBody(raw, resp.Header.Get("Content-Type"))
-	js := stripGoogleIntegrityAssignments(string(txt), target.Host)
-	return []byte(jsBootstrapLine + rewriteJSFile(js)), false, nil
+	// Google SRI cleanup is HTML-only; external JS is invoked upstream with
+	// skipUrlRewrite=true, so its integrity assignments must stay untouched.
+	return []byte(jsBootstrapLine + rewriteJSFile(string(txt))), false, nil
 }
 
 // ----------------------------------------------------------------------------

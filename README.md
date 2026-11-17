@@ -29,7 +29,7 @@ user browser +--------------->+ siteproxy-go   +-------> wikipedia
 | 无引号 HTML 属性重写（如百度 `href=//...`） | ➖ | ✅ 额外支持 |
 | SSE / 流式响应（Duck.ai 对话依赖） | ✅ | ✅ 逐块 flush |
 | WebSocket 双向代理（Telegram Web 等） | ➖ node 模式不支持 | ✅ hijack + 双向管道 |
-| 被墙站点黑名单 | ➖ node 模式忽略 blocked_sites | ✅ 仅显式配置生效 |
+| 被墙站点黑名单 | ➖ node 模式忽略 blocked_sites | ✅ 仅显式配置生效（Unicode 域名按 IDNA 规范化） |
 | 首页（solarized 明暗双主题） | ✅ | ✅ 原版移植 |
 | Duck.ai / 常用网站入口 | ✅ | ✅ 首页内置链接 |
 | 单文件部署 | ❌ 需 Node 22 | ✅ ~11MB 静态二进制 |
@@ -74,7 +74,7 @@ linux/amd64、linux/arm64、darwin/amd64、darwin/arm64、windows/amd64、freebs
 | `token_prefix` | 访问密码，**首尾斜杠必须保留**；`""`、`"/"`、`"//"` 与上游一致归一化为共享密码 `/default/` 并启用 `default_password`（首页和非法路径 302 到 netptop 入口）。需要真正免密码时使用独立字段 `disable_auth: true`，不要在旧配置里继续用 `"/"` 代表免密码 |
 | `disable_auth` | 显式关闭 token 鉴权（Go 扩展，默认 `false`）；关闭后 URL 形状为 `/{proto}/{host}/...`，启动时会打印警告 |
 | `local_listen_port` | 监听端口（默认 5006，与原版/nginx 配置兼容） |
-| `blocked_sites` | 禁止代理的站点列表；仅按此处显式配置生效，不内置任何域名 |
+| `blocked_sites` | 禁止代理的站点列表；仅按此处显式配置生效，不内置任何域名；Unicode 域名按 IDNA 规范化为 punycode 后匹配 |
 | `cookie_max_age_seconds` | 非控制 Cookie 的生命周期上限，默认 `1800`；短于上限的 `Max-Age` / `Expires` 原样保留，超长才截断；设为 `0` 完全保留上游过期策略 |
 
 环境变量（优先级高于 config.json，便于容器部署）：
@@ -425,8 +425,9 @@ Go 版面向 VPS 部署（与原版 Node VPS 部署方式一致）。原版为�
   没有 `Expires` 的 Cookie 追加 `Max-Age=1800`，会丢失站点自己的短生命周期设置。
   可用 `cookie_max_age_seconds: 0` 完全保留上游原始过期策略。`Domain` 仍一律剥离成 host-only。
 - **Secure / SameSite 归一**：HTTPS 部署下原样保留 `Secure` 与 `SameSite=None/Strict`；纯 HTTP 部署下去掉 `Secure`，并仅把浏览器会拒收的 `SameSite=None` 改为 `Lax`。
-- **控制 cookie**：两版一致——仅在被重写的文本响应（html/js/css，status<500）上追加
-  `proxy_real_protocol/host; Path=/; HttpOnly`，并在上游转发前过滤。
+- **控制 cookie**：两版一致——仅在被重写或超限原样转发的文本响应（html/js/css，status<500）上追加
+  `proxy_real_protocol/host; Path=/; HttpOnly`，并在上游转发前过滤；超过 16 MiB 的页面仍会带上站点上下文，
+  避免客户端越界请求修复失效。
 - **X-Forwarded-For**：原版不向上游发送，Go 版同样不发送。
 - **Connection 命名头**：Go 当前会转发普通头（只过滤固定 hop-by-hop 集合）；原版 Node fetch 对部分 Connection 命名头会在运行时拒绝。该边界尚未完全对齐，README 不再声称“严格一致”。
 - **srcset 解析**：与原版 v2.7.10 算法逐字节一致（URL token 扫描到空白为止、仅尾部逗号作分隔符），
@@ -441,8 +442,9 @@ Go 版面向 VPS 部署（与原版 Node VPS 部署方式一致）。原版为�
 - **默认密码（已对齐）**：`token_prefix` 为 `""`、`"/"`、`"//"` 时两版都归一化为 `/default/` 并启用 `default_password`；首页和非法路径 302 到 `www.netptop.com` 的代理入口。Go 的免密码模式改为显式 `disable_auth: true`，避免旧 Node 配置切换后静默变成公开代理。
 - **响应头清理**：`Permissions-Policy-Report-Only` 与 `Permissions-Policy` 一样剥离；204/304 和重定向不再保留上游的 `Content-Length`/`Content-Encoding`/`Transfer-Encoding`。
 - **客户端兼容面**：补齐 `getRefererFromLocation`、`getHostFromProxyPrefixedURL`、`getPathnameFromProxyPrefixedURL`、`getProtocolFromProxyPrefixedURL`、`setProtocolFromProxyPrefixedURL`、`siteproxyAttributeChanged`、`debouncedAttributeChanged`、`siteproxyRegReplacementFallback`、`removeProxyPrefixFallback`，并在 fetch/XHR 发送 `siteproxy-target-*` 等上游头；`fetch(Request, init)` 保留 `init`，历史 API 改为 patch `History.prototype`。
-- **Service Worker 鉴权**：Go 的注册 URL 额外携带 `token_prefix` 且版本为 `v=4`，服务端校验 token 后才返回
-  Worker；原版为 `v=3`、只要求 `proxy_real_host`，任何匿名请求都能读取含 token 的 Worker。升级时 Go 会通过
+- **Service Worker 鉴权**：Go 的注册 URL 额外携带 `token_prefix` 且版本为 `v=4`，服务端同时校验 token 和
+  合法的 `proxy_real_host` 后才返回 Worker；缺少或非法 host 与上游一样返回 404，且不会从 Referer 回填目标。
+  原版为 `v=3`、只要求 `proxy_real_host`，任何匿名请求都能读取含 token 的 Worker。升级时 Go 会通过
   `registrationMatches` 重新注册并自愈。
 - **超大响应头（有意保留）**：原版在 Node 模式对超过 4096 字节的非 Set-Cookie 响应头，无 SW 时直接丢弃，
   有 SW 时通过 `x-siteproxy-body-headers` + `SITEPROXYHDR` 帧塞进响应体由 SW 还原；Go 的 HTTP 栈
@@ -466,10 +468,14 @@ Go 版面向 VPS 部署（与原版 Node VPS 部署方式一致）。原版为�
   不支持 Proxy 的环境自动降级；补齐 `window.delay` / `removeProxyPrefix` / `traverseAndModifyNode` /
   `cookieInterceptionRan` 兼容面；拒绝 `requestStorageAccessFor` / `serviceWorker` 时使用上游一致的
   `NotAllowedError`。
-- **Telegram URL 重写豁免**：目标 host 含 `telegram.org` 时跳过 href/src/srcset/style url() 等 URL 重写，
-  仅保留标识符重写与 integrity 清理（与原版 `_0x461d75` 一致）。
+- **Telegram 特殊分支**：目标 host 含 `telegram.org` 时与上游 `_0x4b0bf2` 的 Telegram 分支一致，
+  跳过 URL、内联脚本标识符、integrity/crossorigin 和 meta CSP 处理，只保留字符集处理与运行时注入。
 - **Google 内联 integrity 清理**：目标 host 含 `google.com` 时删除内联脚本中的 `;x.integrity='sha...';`
   赋值，避免重写后的脚本 SRI 校验失败（与原版 `_0x1afa37` 一致）。
+- **IDN 目标主机**：Unicode 或百分号编码的主机会规范化为 punycode 后再构造上游 URL，
+  避免浏览器生成的 IDN 链接在路由阶段返回 404；原版 Node 的 URL 解析同样接受 IDN。
+- **客户端运行时路由**：任何以 `/siteproxy-response-injected.js` 结尾的路径都返回运行时脚本，
+  并带 `Cache-Control: no-cache, no-store, must-revalidate`（与上游中间件一致）。
 - **路径中间 token 修复**：路径任意位置出现 token 时按其后 `{proto}/{host}/{path}` 重新锚定
   （`/foo/{token}/http/host/x` 可用），与原版 `_0x41151c` 一致。原版只在 host 后还有路径时修复；
   对 `/foo/{token}/http/host`（host-only）两版都返回 404，不代理站点根。
@@ -477,6 +483,7 @@ Go 版面向 VPS 部署（与原版 Node VPS 部署方式一致）。原版为�
   还原为真实 URL，覆盖 `redirect=`、`return_url=` 等跳转链路（与原版 `_0x2a0626` 一致）。
 - **硬编码黑名单**：Go 版仍只按 `blocked_sites` 显式配置生效；原版 Node 内置
   `telegram.org/service_worker.js`、`elcomercio.pe`、`exchangebank.com` 三条规则，本移植未内置。
+  配置中的 Unicode 域名会先按 IDNA 规范化为 punycode，与目标主机使用同一套匹配规则，避免 Unicode 条目失效。
 
 以下行为已与原版 node 模式对齐：URL 格式、常见 HTML/CSS/JS 重写、注入脚本与内联引导脚本、
 cookie 路径隔离、431 超大 Cookie 自愈、out-of-scope 路径修复、路径内 token 修复、CSP 剥离、

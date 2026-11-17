@@ -6,8 +6,9 @@ import (
 	"testing"
 )
 
-// P-01: telegram.org skips URL rewriting, but identifier rewriting and
-// script/link integrity cleanup still run.
+// P-30: Telegram pages use the upstream dedicated branch. URL rewriting,
+// identifier rewriting and integrity cleanup are all skipped; only charset
+// normalization and injection remain.
 func TestTelegramHostSkipsURLRewrite(t *testing.T) {
 	html := `<html><head></head><body>` +
 		`<a href="https://example.com/a?b=1#c">abs</a>` +
@@ -26,11 +27,14 @@ func TestTelegramHostSkipsURLRewrite(t *testing.T) {
 	if strings.Contains(out, "proxy.test"+token+"https/cdn.example.com") {
 		t.Errorf("telegram srcset URL was rewritten:\n%s", out)
 	}
-	if strings.Contains(out, "integrity=") {
-		t.Errorf("script integrity attribute was not removed:\n%s", out)
+	if !strings.Contains(out, `integrity="sha384-x"`) {
+		t.Errorf("telegram script integrity was removed:\n%s", out)
 	}
-	if !strings.Contains(out, "window.___location.href") {
-		t.Errorf("identifier rewriting did not run:\n%s", out)
+	if strings.Contains(out, "window.___location.href") {
+		t.Errorf("telegram inline identifier was rewritten:\n%s", out)
+	}
+	if !strings.Contains(out, `window.location.href = "/dashboard"`) {
+		t.Errorf("telegram inline script was altered:\n%s", out)
 	}
 }
 

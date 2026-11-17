@@ -142,10 +142,14 @@ async function handleFetch(event) {
     return new Response('', { status: 200, headers: { 'content-type': 'text/javascript' } });
   }
 
+  const headers = new Headers(req.headers);
+
   // Determine the current site context: client window URL first, then the
-  // request referer, then the last PROXY_CUR_LOCATION message.
+  // request referer, then the page runtime headers, then the last
+  // PROXY_CUR_LOCATION message.
   let siteProto = self.proxy_target_protocol || curLocation.protocol;
   let siteHost = self.proxy_target_host || curLocation.host;
+  let siteReferer = '';
   let client = null;
   try {
     client = event.clientId ? await self.clients.get(event.clientId) : null;
@@ -163,7 +167,6 @@ async function handleFetch(event) {
     }
   }
 
-  const headers = new Headers(req.headers);
   headers.set('siteproxy-sw', '1');
 
   // The referer must stay the current page's real origin, even when the
@@ -171,6 +174,7 @@ async function handleFetch(event) {
   const siteOrigin = siteProto + '://' + siteHost;
   let fetchURL = req.url;
   const isSelfScripts = url.host === PROXY_HOST && isSelfScriptPath(url.pathname);
+  const sameProxyHost = url.host === PROXY_HOST;
 
   if (siteProto !== undefined && !isSelfScripts &&
       (url.host !== PROXY_HOST || !pathInScope(url.pathname))) {
@@ -178,6 +182,19 @@ async function handleFetch(event) {
     // the proxy scope.
     if (siteHost !== url.host && url.host !== PROXY_HOST) {
       siteHost = url.host; // cross-origin request: use its own host
+    } else if (sameProxyHost && headers.get('siteproxy-target-host') &&
+               !url.pathname.includes(TOKEN_PREFIX)) {
+      // Upstream treats the target headers as an else-if of the cross-origin
+      // repair, so they still override a context obtained from the client URL
+      // or Referer. Same-origin out-of-scope fetch/XHR calls use the explicit
+      // target plus the actual page URL as Referer.
+      const targetHost = headers.get('siteproxy-target-host');
+      const targetProto = headers.get('siteproxy-target-protocol');
+      if (targetHost && (targetProto === 'http' || targetProto === 'https')) {
+        siteHost = targetHost;
+        siteProto = targetProto;
+        siteReferer = headers.get('siteproxy-real-referer') || '';
+      }
     }
     if (siteHost !== PROXY_HOST) {
       // Same-origin requests are still under the deployment base path; that
@@ -194,7 +211,8 @@ async function handleFetch(event) {
 
   // Only send a real referer when the site context is known; otherwise an
   // empty host would produce an invalid "https://" Referer upstream.
-  if (siteHost) headers.set('siteproxy-newreferer', siteOrigin);
+  if (siteReferer) headers.set('siteproxy-newreferer', siteReferer);
+  else if (siteHost) headers.set('siteproxy-newreferer', siteOrigin);
 
   const init = {
     method: req.method,
