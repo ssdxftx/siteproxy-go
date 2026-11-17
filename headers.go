@@ -312,8 +312,12 @@ func rewriteSetCookie(sc, token, sitePrefix string, cfg *Config) string {
 	}
 	isControl := name == "proxy_real_host" || name == "proxy_real_protocol"
 	capLifetime := cfg.CookieMaxAge > 0 && !isControl
+	maxAge := time.Duration(cfg.CookieMaxAge) * time.Second
 	hasPastExpires := false
 	hasDeleteMaxAge := false
+	// hasLifetime reports that a Max-Age or future Expires attribute survived
+	// in the output, so the cap must not be appended on top of it.
+	hasLifetime := false
 
 	// Extract attributes, dropping/rewriting the isolation-relevant ones.
 	// Attribute names are parsed with optional whitespace around '=' (e.g.
@@ -336,20 +340,44 @@ func rewriteSetCookie(sc, token, sitePrefix string, cfg *Config) string {
 			// drop: cookies become host-only on the proxy domain
 		case "max-age":
 			n, err := strconv.Atoi(val)
-			if err == nil && n <= 0 {
+			if err != nil {
+				// Preserve malformed values; the browser treats them as a
+				// session cookie, which is shorter than the cap.
+				attrs = append(attrs, p)
+				hasLifetime = true
+				continue
+			}
+			if n <= 0 {
 				hasDeleteMaxAge = true
+				attrs = append(attrs, p)
+				continue
 			}
-			if capLifetime && !(err == nil && n <= 0) {
-				continue // replace a positive/malformed Max-Age with the cap
+			// This is a CAP, not a fixed lifetime: never extend a cookie
+			// that the origin asked to expire sooner.
+			if capLifetime && time.Duration(n)*time.Second > maxAge {
+				attrs = append(attrs, "Max-Age="+strconv.Itoa(cfg.CookieMaxAge))
+			} else {
+				attrs = append(attrs, p)
 			}
-			attrs = append(attrs, p)
+			hasLifetime = true
 		case "expires":
 			if capLifetime {
 				if t, err := http.ParseTime(val); err == nil {
-					if !t.Before(time.Now()) {
-						continue // replace future expiry with the cap
+					now := time.Now()
+					if t.Before(now) {
+						hasPastExpires = true
+						attrs = append(attrs, p)
+						continue
 					}
-					hasPastExpires = true
+					if t.Sub(now) > maxAge {
+						// Longer than the cap: replace with the capped
+						// Max-Age instead of extending a shorter expiry.
+						attrs = append(attrs, "Max-Age="+strconv.Itoa(cfg.CookieMaxAge))
+					} else {
+						attrs = append(attrs, p)
+					}
+					hasLifetime = true
+					continue
 				}
 			}
 			attrs = append(attrs, p)
@@ -399,7 +427,7 @@ func rewriteSetCookie(sc, token, sitePrefix string, cfg *Config) string {
 	for _, a := range attrs {
 		out += "; " + a
 	}
-	if capLifetime && !hasPastExpires && !hasDeleteMaxAge {
+	if capLifetime && !hasPastExpires && !hasDeleteMaxAge && !hasLifetime {
 		out += "; Max-Age=" + strconv.Itoa(cfg.CookieMaxAge)
 	}
 	return out

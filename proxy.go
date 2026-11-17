@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -174,6 +175,14 @@ func (p *Proxy) proxyHostOnly() string {
 // path-isolated cookie jar are all adjusted here.
 func (p *Proxy) buildUpstreamRequest(r *http.Request, target *TargetInfo) (*http.Request, io.Reader, error) {
 	targetURL := target.URL()
+	// Query parameters frequently carry return/redirect URLs that were
+	// themselves rewritten by the page. Restore the first proxy-form URL in
+	// the query before sending it upstream (upstream `_0x2a0626`).
+	if q := unrewriteQueryProxyURLs(target.RawQuery, p.publicPrefix()); q != target.RawQuery {
+		copy := *target
+		copy.RawQuery = q
+		targetURL = copy.URL()
+	}
 	if !strings.HasPrefix(targetURL, "http://") && !strings.HasPrefix(targetURL, "https://") {
 		return nil, nil, fmt.Errorf("invalid target URL %q", targetURL)
 	}
@@ -558,6 +567,28 @@ func (fw flushWriter) Write(p []byte) (int, error) {
 // rewritten URL is built with (same shape as the original siteproxy).
 func (p *Proxy) publicPrefix() string { return p.cfg.ProxyURL + p.cfg.TokenPrefix }
 
+// unrewriteQueryProxyURLs restores the first proxy-form URL embedded in a
+// raw query string:
+//
+//	u=http://proxy/token/https/example.com/x -> u=https://example.com/x
+//
+// It mirrors upstream `_0x2a0626`, which replaces
+// `{proxy_url}{token_prefix}(http[s]?)/([^/]+)` with `$1://$2`.
+func unrewriteQueryProxyURLs(rawQuery, publicPrefix string) string {
+	if rawQuery == "" || publicPrefix == "" {
+		return rawQuery
+	}
+	re := regexp.MustCompile(regexp.QuoteMeta(publicPrefix) + `(http[s]?)/([^/]+)`)
+	// Upstream uses String.replace without the /g flag: only the first
+	// occurrence is restored. Replacing every occurrence would silently
+	// rewrite unrelated parameters that happen to look like proxy URLs.
+	m := re.FindStringSubmatchIndex(rawQuery)
+	if m == nil {
+		return rawQuery
+	}
+	return rawQuery[:m[0]] + rawQuery[m[2]:m[3]] + "://" + rawQuery[m[4]:m[5]] + rawQuery[m[1]:]
+}
+
 // renderHTML buffers, rewrites and injects scripts into HTML documents.
 func (p *Proxy) renderHTML(resp *http.Response, body io.Reader, target *TargetInfo) ([]byte, bool, error) {
 	raw, truncated, err := readAllLimited(body, maxRewriteBody)
@@ -577,7 +608,7 @@ func (p *Proxy) renderHTML(resp *http.Response, body io.Reader, target *TargetIn
 	rewriteCharset := used != "" || utf8.Valid(raw)
 	base := p.cfg.ProxyURL + p.cfg.TokenPrefix + target.SitePrefix() + target.Path
 	inject := renderInlineBootstrap(p.cfg, target.Protocol, target.Host) + injectedScriptTagAt(p.cfg.BasePath())
-	return []byte(rewriteHTMLWithCharset(html, p.publicPrefix(), base, p.proxyHost(), inject, rewriteCharset)), false, nil
+	return []byte(rewriteHTMLForHost(html, p.publicPrefix(), base, p.proxyHost(), inject, rewriteCharset, target.Host)), false, nil
 }
 
 // renderCSS rewrites url(...) / @import inside stylesheets (upstream node
@@ -600,6 +631,9 @@ func (p *Proxy) renderCSS(resp *http.Response, body io.Reader, target *TargetInf
 	if used != "" || utf8.Valid(txt) {
 		txt = rewriteCSSCharset(txt)
 	}
+	if skipURLRewriteForHost(target.Host) {
+		return txt, false, nil
+	}
 	base := p.cfg.ProxyURL + p.cfg.TokenPrefix + target.SitePrefix() + target.Path
 	return []byte(rewriteCSS(string(txt), p.publicPrefix(), base, p.proxyHost())), false, nil
 }
@@ -620,7 +654,8 @@ func (p *Proxy) renderJS(resp *http.Response, body io.Reader, target *TargetInfo
 		return raw, false, nil
 	}
 	txt, _ := decodeTextBody(raw, resp.Header.Get("Content-Type"))
-	return []byte(jsBootstrapLine + rewriteJSFile(string(txt))), false, nil
+	js := stripGoogleIntegrityAssignments(string(txt), target.Host)
+	return []byte(jsBootstrapLine + rewriteJSFile(js)), false, nil
 }
 
 // ----------------------------------------------------------------------------

@@ -27,6 +27,15 @@
   if (window.siteproxy_injected_flag) return; // idempotent
   window.siteproxy_injected_flag = true;
 
+  // Upstream defines a small Proxy fallback so the runtime still loads on
+  // engines without Proxy support. Without it `new Proxy(...)` below would
+  // throw and every other override would be skipped.
+  try {
+    if (typeof window.Proxy === 'undefined') {
+      window.Proxy = function (target) { return target; };
+    }
+  } catch (e) { /* ignore */ }
+
   // The external script is static: no config/token is baked into this file.
   // The inline bootstrap (which always runs before this script on proxied
   // pages) defines the globals read here. A bare direct fetch therefore gets
@@ -374,7 +383,27 @@
       }
     });
 
-    var wrapper = new Wrapper(realLocation);
+    // Upstream wraps the wrapper in a Proxy so properties the wrapper does
+    // not model (location.ancestorOrigins, ...) fall through to the real
+    // window.location instead of returning undefined. Methods stay bound to
+    // the wrapper so `this.originalLocation` keeps working.
+    var wrapper = new Proxy(new Wrapper(realLocation), {
+      get: function (target, prop) {
+        if (prop in target) {
+          var value = target[prop];
+          return typeof value === 'function' ? value.bind(target) : value;
+        }
+        return realLocation[prop];
+      },
+      set: function (target, prop, value) {
+        if (prop in target) {
+          target[prop] = value;
+        } else {
+          realLocation[prop] = value;
+        }
+        return true;
+      }
+    });
     try { delete window.___location; } catch (e) { /* ignore */ }
     window.___location = wrapper;
     try { delete document.___location; } catch (e) { /* ignore */ }
@@ -597,7 +626,7 @@
   // ------------------------------------------------------------------
   (function () {
     function blockedStorageAccess() {
-      return Promise.reject(new DOMException('requestStorageAccessFor blocked by proxy', 'SecurityError'));
+      return Promise.reject(new DOMException('requestStorageAccessFor blocked by proxy', 'NotAllowedError'));
     }
     try {
       delete document.___requestStorageAccessFor;
@@ -718,6 +747,7 @@
       console.warn('[siteproxy] failed to trap document.cookie:', e);
       return;
     }
+    window.cookieInterceptionRan = true;
 
     // Control cookies (non-HttpOnly copies so page scripts / diagnostics can
     // read the current site context; the server filters them before
@@ -782,7 +812,7 @@
         onmessage: null,
         oncontrollerchange: null,
         register: function () {
-          return Promise.reject(new DOMException('serviceWorker blocked by proxy', 'SecurityError'));
+          return Promise.reject(new DOMException('serviceWorker blocked by proxy', 'NotAllowedError'));
         },
         getRegistrations: function () { return Promise.resolve([]); },
         addEventListener: function () {},
@@ -1300,6 +1330,14 @@
 
   // Expose minimal internals for debugging.
   window.siteproxyRegReplacement = function (u) { return proxyRewrite(u); };
+  // Upstream compatibility surface used by page scripts and iframe hooks.
+  window.removeProxyPrefix = unRewriteURL;
+  window.delay = function (ms) {
+    return new Promise(function (resolve) { setTimeout(resolve, ms); });
+  };
+  window.traverseAndModifyNode = function (node) {
+    traverse(node || document);
+  };
   // Upstream compatibility surface: page scripts/tools may rely on urlMeta.
   window.urlMeta = {
     rewrite: proxyRewrite,

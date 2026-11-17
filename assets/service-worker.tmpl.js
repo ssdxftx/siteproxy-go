@@ -45,6 +45,19 @@ let curLocation = {
   host: CONFIG.proxy_real_host || ''
 };
 
+// Upstream compatibility: pages may register per-path real-site mappings.
+// The upstream SW stores them for 30s and exposes the same message channel;
+// its client currently only defines (never sends) the message, so the map is
+// kept for API parity without changing request routing.
+const hostMap = Object.create(null);
+function pruneHostMap() {
+  const now = Date.now();
+  for (const key in hostMap) {
+    if (now > hostMap[key].lasttime + 30000) delete hostMap[key];
+  }
+}
+setInterval(pruneHostMap, 2000);
+
 self.addEventListener('install', (event) => {
   self.skipWaiting();
 });
@@ -61,6 +74,13 @@ self.addEventListener('message', (event) => {
       self.proxy_target_protocol = d.protocol;
       self.proxy_target_host = d.host;
     }
+  } else if (event.data && event.data.type === 'PROXY_URL_HOST_MAP' && event.data.data) {
+    const d = event.data.data;
+    hostMap[d.pathname] = {
+      real_protocol: d.real_protocol,
+      real_host: d.real_host,
+      lasttime: Date.now()
+    };
   }
 });
 

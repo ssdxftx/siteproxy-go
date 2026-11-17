@@ -201,6 +201,13 @@ func rewriteCharsetMeta(html string) string {
 // The declared charset is resolved from (in order): the Content-Type header,
 // a BOM, the <meta charset> / <meta http-equiv=Content-Type> tag.
 // The second return value is the charset actually used ("" for UTF-8).
+// validUTF8OrReplace mirrors TextDecoder("utf-8") for invalid input: every
+// invalid byte sequence is replaced instead of being emitted verbatim, so the
+// response never advertises UTF-8 while containing invalid bytes.
+func validUTF8OrReplace(raw []byte) string {
+	return strings.ToValidUTF8(string(raw), "\uFFFD")
+}
+
 func decodeHTMLBody(raw []byte, contentTypeHeader string) (string, string) {
 	// BOM sniffing first: UTF-16 BOMs cannot be reliably scanned as ASCII.
 	switch {
@@ -209,7 +216,7 @@ func decodeHTMLBody(raw []byte, contentTypeHeader string) (string, string) {
 	case bytes.HasPrefix(raw, bomUTF16BE):
 		return decodeUTF16(raw, "utf-16be")
 	case bytes.HasPrefix(raw, bomUTF8):
-		return string(bytes.TrimPrefix(raw, bomUTF8)), ""
+		return validUTF8OrReplace(bytes.TrimPrefix(raw, bomUTF8)), ""
 	}
 	// The upstream node pipeline gives an in-document meta charset priority
 	// over the HTTP header (browsers do the same for legacy documents).
@@ -221,7 +228,7 @@ func decodeHTMLBody(raw []byte, contentTypeHeader string) (string, string) {
 		if !isUTF8(cs) {
 			return decodeBytes(raw, cs)
 		}
-		return string(raw), ""
+		return validUTF8OrReplace(raw), ""
 	}
 	if m := xmlEncodingRe.FindSubmatch(window); m != nil {
 		cs := string(m[1])
@@ -232,7 +239,7 @@ func decodeHTMLBody(raw []byte, contentTypeHeader string) (string, string) {
 	if cs := charsetFromContentType(contentTypeHeader); cs != "" && !isUTF8(cs) {
 		return decodeBytes(raw, cs)
 	}
-	return string(raw), ""
+	return validUTF8OrReplace(raw), ""
 }
 
 // htmlBodyCharset reports the charset a browser will effectively use for raw
@@ -287,9 +294,12 @@ func decodeTextBody(raw []byte, contentTypeHeader string) ([]byte, string) {
 		}
 	}
 	if cs == "" || isUTF8(cs) {
-		return raw, ""
+		return []byte(validUTF8OrReplace(raw)), ""
 	}
 	out, used := decodeBytes(raw, cs)
+	if used == "" {
+		return raw, ""
+	}
 	return []byte(out), used
 }
 

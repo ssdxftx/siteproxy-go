@@ -6,6 +6,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
+	"unicode/utf8"
 )
 
 func TestCSSDataURINotRewritten(t *testing.T) {
@@ -121,6 +123,20 @@ func TestTruncatedUpstreamReturns502(t *testing.T) {
 	}
 }
 
+func TestDecodeHTMLBodyReplacesInvalidUTF8(t *testing.T) {
+	raw := []byte("a\xff\xfe\x80b")
+	got, used := decodeHTMLBody(raw, "text/html; charset=utf-8")
+	if used != "" {
+		t.Fatalf("used = %q, want empty (already UTF-8)", used)
+	}
+	if got != "a\uFFFDb" {
+		t.Fatalf("invalid UTF-8 not replaced: %q", got)
+	}
+	if !utf8.ValidString(got) {
+		t.Fatalf("decoded body is still invalid UTF-8: %q", got)
+	}
+}
+
 func TestDecodeBytesUnknownCharsetKeepsBytes(t *testing.T) {
 	raw := []byte{0xff, 0xfe, 0x41}
 	s, used := decodeBytes(raw, "x-foo")
@@ -193,6 +209,19 @@ func TestSetCookieMaxAgeCap(t *testing.T) {
 	got = rewriteSetCookie("a=1; Path=/; Max-Age=0", "/t/", "https/t.example", cfg)
 	if strings.Contains(got, "Max-Age=1800") || !strings.Contains(got, "Max-Age=0") {
 		t.Errorf("Max-Age=0 must stay a deletion: %s", got)
+	}
+	got = rewriteSetCookie("a=1; Path=/; Max-Age=60", "/t/", "https/t.example", cfg)
+	if !strings.Contains(got, "Max-Age=60") || strings.Contains(got, "Max-Age=1800") {
+		t.Errorf("short Max-Age must not be extended to the cap: %s", got)
+	}
+	got = rewriteSetCookie("a=1; Path=/; Max-Age=99999", "/t/", "https/t.example", cfg)
+	if !strings.Contains(got, "Max-Age=1800") || strings.Contains(got, "Max-Age=99999") {
+		t.Errorf("long Max-Age must be capped: %s", got)
+	}
+	soon := time.Now().Add(30 * time.Second).UTC().Format(http.TimeFormat)
+	got = rewriteSetCookie("a=1; Path=/; Expires="+soon, "/t/", "https/t.example", cfg)
+	if !strings.Contains(got, "Expires=") || strings.Contains(got, "Max-Age=1800") {
+		t.Errorf("short Expires must be preserved: %s", got)
 	}
 	got = rewriteSetCookie("proxy_real_host=x; Path=/; Expires=Wed, 21 Oct 2030 07:28:00 GMT", "/t/", "https/t.example", cfg)
 	if strings.Contains(got, "Max-Age=") {

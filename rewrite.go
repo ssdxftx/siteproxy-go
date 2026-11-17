@@ -76,7 +76,45 @@ var (
 	firstClosingTagRe = regexp.MustCompile(`</[a-zA-Z0-9]+>`)
 
 	charsetMetaSnippet = `<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">`
+
+	// Hosts whose pages must not have their URLs rewritten (upstream
+	// `_0x542024`). Telegram Web manages its own routing and breaks when its
+	// absolute/protocol-relative URLs are replaced with proxy paths.
+	urlRewriteExemptHosts = []string{"telegram.org"}
+
+	// Google pages embed SRI integrity in inline script assignments
+	// (upstream `_0x1afa37`). Rewritten script bodies change the hash, so the
+	// assignment has to be removed before the browser evaluates it.
+	googleIntegrityHosts    = []string{"google.com"}
+	googleIntegrityAssignRe = regexp.MustCompile(`;\w+?\.integrity='sha.+?';`)
 )
+
+// hostContainsAny reports whether host contains one of the configured
+// substrings, case-insensitively (upstream uses String.includes).
+func hostContainsAny(host string, needles []string) bool {
+	host = strings.ToLower(host)
+	for _, needle := range needles {
+		if strings.Contains(host, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+// skipURLRewriteForHost reports whether URL rewriting must be skipped for a
+// target host while identifier rewriting / integrity cleanup still run.
+func skipURLRewriteForHost(host string) bool {
+	return hostContainsAny(host, urlRewriteExemptHosts)
+}
+
+// stripGoogleIntegrityAssignments removes `;x.integrity='sha...';` from Google
+// response bodies, mirroring the upstream replacement table.
+func stripGoogleIntegrityAssignments(body, host string) string {
+	if !hostContainsAny(host, googleIntegrityHosts) {
+		return body
+	}
+	return googleIntegrityAssignRe.ReplaceAllString(body, ";")
+}
 
 // injectedScriptTag is the external client runtime script tag for a root
 // deployment (upstream v=4).
@@ -111,7 +149,7 @@ func attrValueRegex(names string) *regexp.Regexp {
 //	runtime tag) — it is page-specific because the inline bootstrap carries
 //	the current site context.
 func rewriteHTML(html, publicPrefix, baseProxiedURL, proxyHost, injectSnippet string) string {
-	return rewriteHTMLWithCharset(html, publicPrefix, baseProxiedURL, proxyHost, injectSnippet, true)
+	return rewriteHTMLForHost(html, publicPrefix, baseProxiedURL, proxyHost, injectSnippet, true, "")
 }
 
 // rewriteHTMLWithCharset is rewriteHTML with control over the charset-meta
@@ -119,6 +157,21 @@ func rewriteHTML(html, publicPrefix, baseProxiedURL, proxyHost, injectSnippet st
 // legacy charset), rewriting the meta to UTF-8 would only make the mojibake
 // permanent; the caller therefore passes false and keeps the original meta.
 func rewriteHTMLWithCharset(html, publicPrefix, baseProxiedURL, proxyHost, injectSnippet string, rewriteCharset bool) string {
+	return rewriteHTMLForHost(html, publicPrefix, baseProxiedURL, proxyHost, injectSnippet, rewriteCharset, "")
+}
+
+// rewriteHTMLForHost is the full server-side HTML pipeline for a concrete
+// target host. It implements the two upstream host-specific special cases:
+//
+//   - google.com: remove inline `*.integrity='sha...'` assignments before
+//     any other pass runs;
+//   - telegram.org: skip URL rewriting entirely (identifier rewriting and
+//     script/link integrity cleanup still run).
+func rewriteHTMLForHost(html, publicPrefix, baseProxiedURL, proxyHost, injectSnippet string, rewriteCharset bool, targetHost string) string {
+	// Google's inline SRI assignments must be removed before script bodies
+	// are stashed, otherwise the replacement cannot see them.
+	html = stripGoogleIntegrityAssignments(html, targetHost)
+
 	// Script bodies must not be touched by the URL rewriter (a regex
 	// literal or a string containing `href="..."` would be corrupted).
 	// Stash them first and restore after the URL pipeline.
@@ -135,46 +188,48 @@ func rewriteHTMLWithCharset(html, publicPrefix, baseProxiedURL, proxyHost, injec
 		html = rewriteCharsetMeta(html)
 	}
 
-	// 0. Quoted absolute/root-relative URLs in arbitrary tag attributes
-	//    (upstream generic quoted-URL pass). Script bodies are already
-	//    stashed, so only real attributes are affected.
-	html = rewriteTagQuotedURLs(html, publicPrefix, baseProxiedURL, proxyHost)
+	if !skipURLRewriteForHost(targetHost) {
+		// 0. Quoted absolute/root-relative URLs in arbitrary tag attributes
+		//    (upstream generic quoted-URL pass). Script bodies are already
+		//    stashed, so only real attributes are affected.
+		html = rewriteTagQuotedURLs(html, publicPrefix, baseProxiedURL, proxyHost)
 
-	// 1. Plain URL attributes.
-	html = rewriteQuotedAttrs(html, attrValueRe, func(v string) string {
-		return RewriteWithBase(v, publicPrefix, baseProxiedURL, proxyHost)
-	})
+		// 1. Plain URL attributes.
+		html = rewriteQuotedAttrs(html, attrValueRe, func(v string) string {
+			return RewriteWithBase(v, publicPrefix, baseProxiedURL, proxyHost)
+		})
 
-	// 1b. JavaScript embedded in event handlers / javascript: URLs.
-	html = rewriteQuotedAttrs(html, jsURLAttrRe, rewriteJavascriptURLValue)
-	html = rewriteQuotedAttrs(html, eventAttrRe, rewriteEventAttr)
+		// 1b. JavaScript embedded in event handlers / javascript: URLs.
+		html = rewriteQuotedAttrs(html, jsURLAttrRe, rewriteJavascriptURLValue)
+		html = rewriteQuotedAttrs(html, eventAttrRe, rewriteEventAttr)
 
-	// 2. srcset / imagesrcset candidate lists.
-	html = rewriteQuotedAttrs(html, srcsetAttrRe, func(v string) string {
-		return rewriteSrcset(v, publicPrefix, baseProxiedURL, proxyHost)
-	})
+		// 2. srcset / imagesrcset candidate lists.
+		html = rewriteQuotedAttrs(html, srcsetAttrRe, func(v string) string {
+			return rewriteSrcset(v, publicPrefix, baseProxiedURL, proxyHost)
+		})
 
-	// 3. style="...url(...)" attributes (v2.7.9) and <style> blocks.
-	html = rewriteQuotedAttrs(html, styleAttrRe, func(v string) string {
-		return rewriteCSS(v, publicPrefix, baseProxiedURL, proxyHost)
-	})
-	html = styleTagRe.ReplaceAllStringFunc(html, func(m string) string {
-		g := styleTagRe.FindStringSubmatch(m)
-		return g[1] + rewriteCSS(g[2], publicPrefix, baseProxiedURL, proxyHost) + g[3]
-	})
+		// 3. style="...url(...)" attributes (v2.7.9) and <style> blocks.
+		html = rewriteQuotedAttrs(html, styleAttrRe, func(v string) string {
+			return rewriteCSS(v, publicPrefix, baseProxiedURL, proxyHost)
+		})
+		html = styleTagRe.ReplaceAllStringFunc(html, func(m string) string {
+			g := styleTagRe.FindStringSubmatch(m)
+			return g[1] + rewriteCSS(g[2], publicPrefix, baseProxiedURL, proxyHost) + g[3]
+		})
 
-	// 4. <base href> rewrite (kept, so that browser-side relative
-	//    resolution continues to work inside the proxy scope).
-	html = rewriteQuotedAttrs(html, baseTagRe, func(v string) string {
-		return RewriteWithBase(v, publicPrefix, baseProxiedURL, proxyHost)
-	})
+		// 4. <base href> rewrite (kept, so that browser-side relative
+		//    resolution continues to work inside the proxy scope).
+		html = rewriteQuotedAttrs(html, baseTagRe, func(v string) string {
+			return RewriteWithBase(v, publicPrefix, baseProxiedURL, proxyHost)
+		})
 
-	// 5. <meta http-equiv=refresh content="2; url=...">.
-	html = rewriteMetaRefresh(html, publicPrefix, baseProxiedURL, proxyHost)
+		// 5. <meta http-equiv=refresh content="2; url=...">.
+		html = rewriteMetaRefresh(html, publicPrefix, baseProxiedURL, proxyHost)
+	}
 
 	// 6. Drop integrity/crossorigin from script/link tags only (rewritten
 	//    bodies break the hashes; removing them from inline JS strings
-	//    would corrupt the script).
+	//    would corrupt the script). Upstream runs this even for telegram.
 	html = scriptOrLinkTagRe.ReplaceAllStringFunc(html, func(tag string) string {
 		return integrityAttrRe.ReplaceAllString(tag, "")
 	})

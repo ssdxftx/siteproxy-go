@@ -150,6 +150,15 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Upstream `_0x41151c`: a token prefix may appear in the middle of a
+	// path when a page mangles its own links or the Service Worker is not in
+	// control. Re-anchor the target to the first valid `{token}{proto}/{host}`
+	// sequence found after the leading token (if any).
+	if target := s.targetFromPathToken(proxyPath, r.URL.RawQuery); target != nil {
+		s.proxy.ServeHTTP(w, r, target)
+		return
+	}
+
 	// Token (password) gate.
 	if !s.cfg.noPassword() && !strings.HasPrefix(proxyPath, s.cfg.TokenPrefix) {
 		// Upstream behaviour: a path outside the token scope is still
@@ -204,6 +213,32 @@ func (s *Server) homepageAllowed(r *http.Request) bool {
 		}
 	}
 	return strings.HasPrefix(path, s.cfg.TokenPrefix)
+}
+
+// targetFromPathToken implements the upstream mid-path token repair: an
+// optional leading token prefix is stripped first, then the next occurrence
+// of the token is used as an anchor for `{proto}/{host}/{path}`.
+//
+//	/foo/token/http/host/a       -> http://host/a
+//	/token/foo/token/http/host/a -> http://host/a
+func (s *Server) targetFromPathToken(path, rawQuery string) *TargetInfo {
+	tokenPrefix := s.cfg.TokenPrefix
+	if tokenPrefix == "" || tokenPrefix == "/" {
+		return nil
+	}
+	path = strings.TrimPrefix(path, tokenPrefix)
+	i := strings.Index(path, tokenPrefix)
+	if i < 0 {
+		return nil
+	}
+	rest := path[i+len(tokenPrefix):]
+	// Upstream `_0x41151c` only rebuilds the target when something follows
+	// the host (the trailing path is what proves this is a mangled link).
+	// A bare `.../{token}/http/host` is left untouched and falls through.
+	if m := pathPrefixRe.FindStringSubmatch(rest); m == nil || m[3] == "" {
+		return nil
+	}
+	return ParseTarget(rest, rawQuery)
 }
 
 // repairOutOfScope mirrors the upstream server-side repair: when the request

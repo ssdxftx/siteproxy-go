@@ -73,7 +73,7 @@ linux/amd64、linux/arm64、darwin/amd64、darwin/arm64、windows/amd64、freebs
 | `token_prefix` | 访问密码，**首尾斜杠必须保留**；空字符串回退到上游默认 token `/user22334455/`，显式设为 `"/"` 表示免密码（Go 扩展，启动时会打印警告） |
 | `local_listen_port` | 监听端口（默认 5006，与原版/nginx 配置兼容） |
 | `blocked_sites` | 禁止代理的站点列表；仅按此处显式配置生效，不内置任何域名 |
-| `cookie_max_age_seconds` | 非控制 Cookie 的生命周期上限，默认 `1800`（与原版一致）；设为 `0` 保留上游原始过期策略 |
+| `cookie_max_age_seconds` | 非控制 Cookie 的生命周期上限，默认 `1800`；短于上限的 `Max-Age` / `Expires` 原样保留，超长才截断；设为 `0` 完全保留上游过期策略 |
 
 环境变量（优先级高于 config.json，便于容器部署）：
 
@@ -401,13 +401,12 @@ Go 版面向 VPS 部署（与原版 Node VPS 部署方式一致）。原版为�
 `x-siteproxy-body-headers` 头走私机制不再需要（Go/nginx 无此限制）。
 
 **Q: 与原版有哪些有意的行为差异（差分测试结论）？**
-对原版 v2.7.11 做过五轮逐请求差分审计（mock 上游 + 真实站点 + 去混淆源码逐函数比对；第二至五轮
-将 HTML/JS/CSS 重写输出、srcset 解析、请求头过滤、Location/Cookie/HEAD 行为逐字节比对到与 node 模式一致），
-以下为经过验证的差异：
+对原版 v2.7.11 做过逐请求差分审计（mock 上游 + 真实站点 + 去混淆源码逐函数比对），
+以下为经过验证的差异（早期“全部逐字节一致”的表述不准确，已按实际差分结果修正）：
 - **压缩响应**：Go 自行解码 gzip/deflate/br 后重写；可运行的 worker bundle 对照中，上游未解码并直接回传压缩字节，Go 的文本重写更完整。
   遇到双方都无法解码的编码（如 zstd）时，原版直接 500 崩溃，Go 版原样透传（保留 Content-Encoding，不重写）。
-- **空 Content-Type**：两版都不补响应头、不重写正文；浏览器按内容嗅探（HTML 会正常渲染）。Go 不再强制 `text/plain`。
-- **非重定向 3xx**：仅 301/302/303/307/308 丢弃正文并重写 `Location`；300/304/305/306/309 保留正文与原始 `Location`（与 node 模式一致）。
+- **空 Content-Type**：Go 不补响应头、不重写正文；浏览器按内容嗅探（HTML 会正常渲染）。原版 Node 会由 `Response` 按字符串正文补出 `text/plain; charset=UTF-8`。
+- **3xx 正文**：仅 301/302/303/307/308 丢弃正文并重写 `Location`；300/305/306/309 保留正文与原始 `Location`。原版对 204 和 304 也会清空正文，Go 对 304 保留表示头并转发（通常无正文）。
 - **206 Partial Content**：Go 原样流式透传字节段并保留 `Content-Range`；上游会把字节段当完整文档重写，导致 `Content-Length` 与 `Content-Range` 冲突。
 - **损坏的 gzip**：Go 回放解码器已消费的头部字节后原样透传；上游直接 500。
 - **Referer / Origin**：带 `Siteproxy-Newreferer` 时 Origin 取该 URL 的 origin；否则从代理 Referer 还原 Referer，
@@ -416,8 +415,10 @@ Go 版面向 VPS 部署（与原版 Node VPS 部署方式一致）。原版为�
 - **HSTS**：Go 剥离 `Strict-Transport-Security`（该头会作用于代理域而非上游域）；原版会原样转发。
 - **自闭合 meta charset**：`<meta charset=gbk/>` 按 `gbk` 解析（原版同样支持，早期 Go 解析成 `gbk/` 导致不转码）。
 - **空响应体**：两版一致——不注入；有 `Content-Type` 时保留并返回空体，无 `Content-Type` 时 Go 同样不追加控制 cookie。
-- **cookie 生命周期**：默认与原版一致，给非控制 Set-Cookie 统一追加 `Max-Age=1800`（30 分钟上限）；
-  可用 `cookie_max_age_seconds: 0` 保留上游原始过期策略。`Domain` 仍一律剥离成 host-only。
+- **cookie 生命周期**：Go 把非控制 Set-Cookie 的生命周期限制在 30 分钟内——原本更短的
+  `Max-Age` / `Expires` 原样保留，超过上限时才截断；上游则删除所有 `Max-Age`，并只给
+  没有 `Expires` 的 Cookie 追加 `Max-Age=1800`，会丢失站点自己的短生命周期设置。
+  可用 `cookie_max_age_seconds: 0` 完全保留上游原始过期策略。`Domain` 仍一律剥离成 host-only。
 - **Secure / SameSite 归一**：HTTPS 部署下原样保留 `Secure` 与 `SameSite=None/Strict`；纯 HTTP 部署下去掉 `Secure`，并仅把浏览器会拒收的 `SameSite=None` 改为 `Lax`。
 - **控制 cookie**：两版一致——仅在被重写的文本响应（html/js/css，status<500）上追加
   `proxy_real_protocol/host; Path=/; HttpOnly`，并在上游转发前过滤。
@@ -427,23 +428,52 @@ Go 版面向 VPS 部署（与原版 Node VPS 部署方式一致）。原版为�
   压缩 HTML（`1x,b.png 2x` 无空格形式）与含逗号 URL 均正确处理。
 - **WebSocket**：原版 node VPS 模式不支持 WebSocket；Go 版原生支持，且升级请求同样过滤控制 cookie
   并接管 hijack 缓冲字节（提前到达的帧不丢失）。
-- **首页 / SW**：原版 node 模式不内置首页与 Service Worker（仅 CF 模式提供）；Go 版两者都提供，行为取 CF 模式超集。
+- **首页 / SW**：原版 node 模式不内置首页，但会动态返回 `/siteproxy_service_worker.js` 并由客户端注册；Go 版同时提供首页与 SW，行为取 CF 模式超集。
 - **`/{token}/` 根路径**：原版 302 跳转到硬编码的 `www.netptop.com`；Go 版直接显示首页（自部署更合理）。
 - **YouTube 播放页重定向**：原版把 `youtube.com/watch` 重定向到 netptop.com 的嵌入播放器（公共站专用）；
   Go 版不做该跳转，保持站内代理播放。
 - **404 处理**：原版 SW 把 404 延迟 3 秒返回（不重发）；Go 版已对齐为延迟后原样返回。
-- **meta refresh / @import 重写**：原版保留相对形式（浏览器按当前代理页解析，结果一致）；
-  Go 版改写为代理绝对 URL，避免 `<base>` 干扰，语义等价。
-- **`x-siteproxy-body-headers`**：原版 node 会把该内部头原样转发给上游；Go 版一律剥离（防内部头泄漏）。
+- **Service Worker 鉴权**：Go 的注册 URL 额外携带 `token_prefix` 且版本为 `v=4`，服务端校验 token 后才返回
+  Worker；原版为 `v=3`、只要求 `proxy_real_host`，任何匿名请求都能读取含 token 的 Worker。升级时 Go 会通过
+  `registrationMatches` 重新注册并自愈。
+- **超大响应头（有意保留）**：原版在 Node 模式对超过 4096 字节的非 Set-Cookie 响应头，无 SW 时直接丢弃，
+  有 SW 时通过 `x-siteproxy-body-headers` + `SITEPROXYHDR` 帧塞进响应体由 SW 还原；Go 的 HTTP 栈
+  没有该平台限制，直接转发大响应头，未实现 SW 拆包。
+- **`Content-Disposition: attachment`（有意保留）**：Go 把附件当字节流原样透传，不注入、不重写、
+  不追加控制 cookie；原版把它当普通 HTML 重写。Go 的行为避免改变用户下载到的文件内容。
+- **字符集声明**：Go 对转码后（以及原本就是合法 UTF-8）的 HTML/CSS/JS 统一加
+  `<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">`（有意保留）；原版只改写已有的
+  charset meta，不额外插入。声明为 UTF-8 的非法字节现在两版都替换为 U+FFFD。
+- **可见文本中的引号 URL（有意保留）**：原版的正则会改写 `<p>`/`<textarea>`/`<pre>` 等文本节点里的
+  `"https://..."`；Go 只改写标签属性，保留页面可见文本原样。
+- **meta refresh / @import 重写**：原版只偶然改写引号紧邻 URL 的写法，绝对 `meta refresh`、
+  裸字符串 `@import "x.css"` 和大写 `URL(...)` 都保留原样；Go 版统一改写为代理绝对 URL，
+  避免 `<base>` 干扰，语义更完整。
+- **`x-siteproxy-body-headers`**：原版与 Go 版都会剥离所有 `siteproxy*` 前缀的请求头，不转发给上游。
 - **响应头剥离超集**：Go 版额外剥离 COOP/COEP/CORP/Permissions-Policy/Alt-Svc 等安全头
   （原版仅剥离 CSP 与 x-frame-options 及 siteproxy*/cf-*/x-forwarded* 家族——Go 已对齐该家族的前缀过滤）。
 - **加固项（Go 版增强）**：handler panic 恢复中间件（单请求 502，不拖垮进程）；out-of-scope 修复路径
   对控制 cookie 中的主机做严格校验（防 cookie 投毒 / userinfo 走私）；客户端运行时增加
-  Element.setAttribute 陷阱与 data-src 重写（与原版客户端对齐）。
+  Element.setAttribute 陷阱与 data-src 重写（与原版客户端对齐）；`___location` 使用 Proxy 并在
+  不支持 Proxy 的环境自动降级；补齐 `window.delay` / `removeProxyPrefix` / `traverseAndModifyNode` /
+  `cookieInterceptionRan` 兼容面；拒绝 `requestStorageAccessFor` / `serviceWorker` 时使用上游一致的
+  `NotAllowedError`。
+- **Telegram URL 重写豁免**：目标 host 含 `telegram.org` 时跳过 href/src/srcset/style url() 等 URL 重写，
+  仅保留标识符重写与 integrity 清理（与原版 `_0x461d75` 一致）。
+- **Google 内联 integrity 清理**：目标 host 含 `google.com` 时删除内联脚本中的 `;x.integrity='sha...';`
+  赋值，避免重写后的脚本 SRI 校验失败（与原版 `_0x1afa37` 一致）。
+- **路径中间 token 修复**：路径任意位置出现 token 时按其后 `{proto}/{host}/{path}` 重新锚定
+  （`/foo/{token}/http/host/x` 可用），与原版 `_0x41151c` 一致。原版只在 host 后还有路径时修复；
+  对 `/foo/{token}/http/host`（host-only）两版都返回 404，不代理站点根。
+- **查询串代理 URL 还原**：上游请求前把 query 中第一个 `{proxy_url}{token_prefix}http(s)/host`
+  还原为真实 URL，覆盖 `redirect=`、`return_url=` 等跳转链路（与原版 `_0x2a0626` 一致）。
+- **硬编码黑名单**：Go 版仍只按 `blocked_sites` 显式配置生效；原版 Node 内置
+  `telegram.org/service_worker.js`、`elcomercio.pe`、`exchangebank.com` 三条规则，本移植未内置。
+
 以下行为已与原版 node 模式对齐：URL 格式、常见 HTML/CSS/JS 重写、注入脚本与内联引导脚本、
-cookie 路径隔离、431 超大 Cookie 自愈、out-of-scope 路径修复、CSP 剥离、字符集转码、
-空响应体、`Location`（仅 301/302/303/307/308）/`Set-Cookie` 头处理。`Refresh` / `Link` 头重写是
-Go 版的安全增强（原版保留真实上游 URL，浏览器会绕过代理直连）。
+cookie 路径隔离、431 超大 Cookie 自愈、out-of-scope 路径修复、路径内 token 修复、CSP 剥离、
+字符集转码、空响应体、`Location`（仅 301/302/303/307/308）/`Set-Cookie` 头处理。
+`Refresh` / `Link` 头重写是 Go 版的安全增强（原版保留真实上游 URL，浏览器会绕过代理直连）。
 
 **Q: 如何修改首页网站列表？**
 编辑 `assets/index.html` 后重新 `make build`（资源以 go:embed 打包进二进制）。
