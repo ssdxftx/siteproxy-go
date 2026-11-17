@@ -148,11 +148,11 @@ func TestEmptyTokenPrefixUsesUpstreamDefault(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.TokenPrefix != defaultTokenPrefix {
-		t.Errorf("empty token_prefix = %q, want %q", cfg.TokenPrefix, defaultTokenPrefix)
+	if cfg.TokenPrefix != "/default/" || !cfg.DefaultPassword {
+		t.Errorf("empty token_prefix = %q, default_password=%v, want /default/ and true", cfg.TokenPrefix, cfg.DefaultPassword)
 	}
-	if got := normalizeTokenPrefix("/"); got != "/" {
-		t.Errorf("explicit / = %q, want /", got)
+	if got := normalizeTokenPrefix("/"); got != "/default/" {
+		t.Errorf("explicit / = %q, want /default/", got)
 	}
 }
 

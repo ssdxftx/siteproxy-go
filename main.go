@@ -59,7 +59,10 @@ func main() {
 	log.Printf("[siteproxy] Listening on http://localhost:%d", cfg.LocalListenPort)
 	log.Printf("[siteproxy] proxy_url=%s token_prefix=%s", cfg.ProxyURL, cfg.TokenPrefix)
 	if cfg.noPassword() {
-		log.Printf("[siteproxy] WARNING: token_prefix is \"/\" - authentication is DISABLED")
+		log.Printf("[siteproxy] WARNING: disable_auth is enabled - authentication is DISABLED")
+	}
+	if cfg.DefaultPassword {
+		log.Printf("[siteproxy] default_password is active: invalid paths redirect to www.netptop.com")
 	}
 
 	// Graceful shutdown on SIGINT/SIGTERM.

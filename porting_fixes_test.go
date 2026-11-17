@@ -26,11 +26,13 @@ func newProxyFor(t *testing.T, upstreamURL, tokenPrefix string) *httptest.Server
 }
 
 func TestDefaultTokenMatchesUpstream(t *testing.T) {
-	if got := normalizeTokenPrefix(""); got != "/user22334455/" {
-		t.Fatalf("empty token_prefix = %q, want upstream default /user22334455/", got)
+	for _, in := range []string{"", "/", "//"} {
+		if got := normalizeTokenPrefix(in); got != "/default/" {
+			t.Fatalf("normalizeTokenPrefix(%q) = %q, want /default/", in, got)
+		}
 	}
-	if got := normalizeTokenPrefix("/"); got != "/" {
-		t.Fatalf("explicit / = %q", got)
+	if got := normalizeTokenPrefix("/user22334455/"); got != "/user22334455/" {
+		t.Fatalf("regular token = %q", got)
 	}
 }
 

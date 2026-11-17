@@ -164,10 +164,15 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		// Upstream behaviour: a path outside the token scope is still
 		// proxied when the request can be attributed to a proxied site
 		// via Referer or the control cookies (both require knowledge
-		// of the proxy session). Otherwise 404 - never leak the
-		// token-bearing homepage to an unauthenticated request.
+		// of the proxy session). Otherwise 404 (or the upstream
+		// default_password redirect) - never leak the token-bearing
+		// homepage to an unauthenticated request.
 		if repaired := s.repairOutOfScope(r); repaired != nil {
 			s.proxy.ServeHTTP(w, r, repaired)
+			return
+		}
+		if s.cfg.DefaultPassword {
+			s.redirectDefaultPassword(w, r)
 			return
 		}
 		http.NotFound(w, r)
@@ -182,6 +187,10 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		// returns 404 for /default/https, /default/http/, ...).
 		if rest == "" {
 			s.serveHomepage(w, r)
+			return
+		}
+		if s.cfg.DefaultPassword {
+			s.redirectDefaultPassword(w, r)
 			return
 		}
 		http.NotFound(w, r)
@@ -376,6 +385,12 @@ func validPort(p string) bool {
 // same HTML rewriter used for proxied pages so the links stay inside the
 // proxy and the runtime scripts get injected.
 func (s *Server) serveHomepage(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.DefaultPassword {
+		// Upstream `default_password` deployments never show the local
+		// token-scoped index: / and /{token}/ redirect to the public entry.
+		s.redirectDefaultPassword(w, r)
+		return
+	}
 	if !s.homepageAllowed(r) {
 		http.NotFound(w, r)
 		return
@@ -387,6 +402,14 @@ func (s *Server) serveHomepage(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
 	w.Header().Set("Content-Length", fmt.Sprint(len(html)))
 	_, _ = w.Write([]byte(html))
+}
+
+// redirectDefaultPassword mirrors upstream `default_password`: after
+// token_prefix was normalised from "", "/" or "//", the proxy redirects its
+// homepage and invalid paths to the public netptop entry (still through the
+// proxy, so the user never leaves the configured public URL).
+func (s *Server) redirectDefaultPassword(w http.ResponseWriter, r *http.Request) {
+	http.Redirect(w, r, s.cfg.ProxyURL+s.cfg.TokenPrefix+"https/www.netptop.com", http.StatusFound)
 }
 
 // serveServiceWorker renders the service worker with the current site context.

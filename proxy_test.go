@@ -698,6 +698,7 @@ func TestNoPasswordMode(t *testing.T) {
 	cfg := newTestConfig(0)
 	cfg.ProxyURL = up.URL
 	cfg.TokenPrefix = "/"
+	cfg.DisableAuth = true
 	srv, _ := NewServer(cfg)
 	ts := httptest.NewServer(srv)
 	defer ts.Close()

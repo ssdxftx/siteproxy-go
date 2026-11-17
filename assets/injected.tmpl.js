@@ -267,6 +267,97 @@
   }
 
   // ------------------------------------------------------------------
+  // 2b. Upstream compatibility helpers exposed to page scripts.
+  //     These names are part of the v2.7.x injected surface (urlMeta and
+  //     iframe helpers); page code may call them directly.
+  // ------------------------------------------------------------------
+  function removeProxyPrefixFallback(u) {
+    if (!u) return u;
+    if (u.startsWith(proxy_url_prefix)) u = u.substring(proxy_url_prefix.length);
+    if (/^[a-z]+:\/\//i.test(u)) return u;
+    var shortToken = token_prefix.charAt(0) === '/' ? token_prefix.substring(1) : token_prefix;
+    if (shortToken && u.indexOf(shortToken) === 0) u = u.substring(shortToken.length);
+    var first = u.split('/')[0].toLowerCase();
+    if (first === 'http' || first === 'https') {
+      return first + '://' + u.substring(first.length + 1);
+    }
+    return proxy_real_protocol + '://' + proxy_real_host + '/' + u;
+  }
+
+  function getRefererFromLocation(href, proto, host) {
+    if (typeof href !== 'string') return href;
+    if (!href.startsWith(config_proxy_url)) return removeProxyPrefixFallback(href);
+    var rest = href.substring(config_proxy_url.length).replace(/^\/+/, '');
+    // Strip the legacy p-frame prefixes and the token (with or without its
+    // leading slash), mirroring the upstream helper.
+    var p = 'p';
+    while (rest.indexOf(p) === 0 || rest.indexOf('/' + p) === 0) {
+      rest = rest.substring(rest.indexOf(p) + p.length);
+    }
+    var shortToken = token_prefix ? token_prefix.substring(1) : '';
+    while (shortToken && (rest.indexOf(shortToken) === 0 || rest.indexOf('/' + shortToken) === 0)) {
+      rest = rest.substring(rest.indexOf(shortToken) + shortToken.length);
+    }
+    rest = rest.replace(/^\/+/, '');
+    if (!rest) return proto + '://' + host + '/';
+    var m = rest.match(/^(http|https|ftp|file|data|javascript|mailto|tel|sms|ssh|vbscript|about|chrome|view-source|webcal|content)\//i);
+    if (m) {
+      var scheme = m[1].toLowerCase();
+      var real = scheme + '://' + rest.substring(m[0].length).replace(/^\/+/, '');
+      try { return new URL(real).href; } catch (e) { return real; }
+    }
+    return proto + '://' + host + '/' + rest;
+  }
+
+  function getHostFromProxyPrefixedURL(u) {
+    var real = unRewriteURL(u);
+    var m = String(real).match(/^[a-z]+:\/\/([^/?#]+)/i);
+    return m ? m[1] : proxy_real_host;
+  }
+
+  function getPathnameFromProxyPrefixedURL(u) {
+    if (!u || typeof u !== 'string' || !u.startsWith(proxy_url_prefix)) return '/';
+    try {
+      var real = unRewriteURL(u);
+      return new URL(real).pathname || '/';
+    } catch (e) {
+      var rest = u.substring(proxy_url_prefix.length).split('/');
+      if (rest.length > 2) return '/' + rest.slice(2).join('/').replace(/^\/+/, '');
+      return '/';
+    }
+  }
+
+  function getProtocolFromProxyPrefixedURL(u) {
+    if (!u || typeof u !== 'string') return proxy_real_protocol;
+    try {
+      var real = unRewriteURL(u);
+      var m = String(real).match(/^([a-z]+):/i);
+      return m ? m[1].toLowerCase() : proxy_real_protocol;
+    } catch (e) { return proxy_real_protocol; }
+  }
+
+  function setProtocolFromProxyPrefixedURL(u, proto) {
+    if (!u || typeof u !== 'string' || !u.startsWith(proxy_url_prefix)) return u;
+    if (proto && proto !== 'http' && proto !== 'https') return u;
+    try {
+      var real = new URL(unRewriteURL(u));
+      if (proto) real.protocol = proto + ':';
+      return proxy_url_prefix + real.protocol.replace(':', '') + '/' + real.host +
+             real.pathname + real.search + real.hash;
+    } catch (e) {
+      return u;
+    }
+  }
+
+  window.removeProxyPrefixFallback = removeProxyPrefixFallback;
+  window.getRefererFromLocation = getRefererFromLocation;
+  window.getHostFromProxyPrefixedURL = getHostFromProxyPrefixedURL;
+  window.getPathnameFromProxyPrefixedURL = getPathnameFromProxyPrefixedURL;
+  window.getProtocolFromProxyPrefixedURL = getProtocolFromProxyPrefixedURL;
+  window.setProtocolFromProxyPrefixedURL = setProtocolFromProxyPrefixedURL;
+  window.siteproxyRegReplacementFallback = proxyRewrite;
+
+  // ------------------------------------------------------------------
   // 3. window.___location — full Location wrapper on the REAL site space.
   //    (The server rewrites `location` -> `___location` in page JS, so this
   //    object receives every read AND write of page location objects.)
@@ -274,9 +365,12 @@
   (function () {
     var realLocation = window.location;
 
-    // Upstream guard: reject non-URL values (null, plain objects, ...)
+    // Upstream guard: reject non-URL values (null, plain objects and the
+    // stringified sentinels that misbehaving page code passes to location).
     function isNotURL(v) {
       if (v == null) return true;
+      if (typeof v === 'string' &&
+          (v === 'undefined' || v === 'null' || v === '[object Object]')) return true;
       if (typeof v === 'object' && !(v instanceof URL)) {
         try { return String(v) === '[object Object]'; } catch (e) { return true; }
       }
@@ -451,25 +545,30 @@
   // 4. history / window.open / fetch / XHR / WebSocket / EventSource /
   //    sendBeacon overrides.
   // ------------------------------------------------------------------
-  var originalPushState = history.pushState.bind(history);
-  var originalReplaceState = history.replaceState.bind(history);
-  // Upstream only patches the top frame (iframes keep native history).
-  if (window.self === window.top) {
-    history.pushState = function (state, title, url) {
+  var originalPushState = history.pushState;
+  var originalReplaceState = history.replaceState;
+  // Upstream patches History.prototype (not each History instance), so
+  // aliased/extracted calls such as `const p = history.pushState` are still
+  // trapped. It only does this in the top frame.
+  if (window.self === window.top && window.History && History.prototype) {
+    History.prototype.pushState = function (state, title, url) {
       var rewritten = (url !== undefined && url !== null) ? proxyRewrite(String(url)) : url;
-      var out = originalPushState(state, title, rewritten);
+      var out = originalPushState.call(this, state, title, rewritten);
       refreshCurrentLocation();
       return out;
     };
-    history.replaceState = function (state, title, url) {
+    History.prototype.replaceState = function (state, title, url) {
       var rewritten = (url !== undefined && url !== null) ? proxyRewrite(String(url)) : url;
-      var out = originalReplaceState(state, title, rewritten);
+      var out = originalReplaceState.call(this, state, title, rewritten);
       refreshCurrentLocation();
       return out;
     };
+    // Upstream keeps the native methods reachable through ___pushState.
+    History.prototype.___pushState = originalPushState;
+    History.prototype.___replaceState = originalReplaceState;
   }
-  // The server rewrites history.pushState/replaceState call sites to these
-  // ___-prefixed aliases; keep them rewriting like the upstream node script.
+  // The inline bootstrap / server call sites use history.___pushState; keep
+  // these instance aliases rewriting as well.
   history.___pushState = function (state, title, url) {
     var rewritten = (url !== undefined && url !== null) ? proxyRewrite(String(url)) : url;
     var out = originalPushState.call(this, state, title, rewritten);
@@ -496,23 +595,34 @@
   if (originalFetch) {
     window.fetch = function (input, init) {
       try {
+        var headers = new Headers(init && init.headers ? init.headers :
+          (input && input.headers) || undefined);
+        // Upstream attaches the real site context to every request. The Go
+        // server strips these siteproxy* headers before forwarding; the
+        // service worker may consume them when the client URL is unavailable.
+        headers.set('siteproxy-target-protocol', proxy_real_protocol);
+        headers.set('siteproxy-target-host', proxy_real_host);
+        headers.set('siteproxy-real-referer',
+          getRefererFromLocation(location.href, proxy_real_protocol, proxy_real_host));
+        headers.set('siteproxy-window-location-pathname',
+          (window.___location && window.___location.pathname) || '/');
+        if (!headers.has('siteproxy-newreferer')) {
+          var real = unRewriteURL(location.href);
+          if (real !== location.href) headers.set('siteproxy-newreferer', real);
+        }
+
         if (typeof input === 'string' || input instanceof URL) {
           input = proxyRewrite(String(input));
         } else if (input && typeof input.url === 'string') {
           var newUrl = proxyRewrite(input.url);
           if (newUrl !== input.url) {
-            // Preserve method/headers/body/mode/credentials/signal/keepalive
-            // etc. by using the original Request as the init.
-            input = new Request(newUrl, input);
+            // Upstream uses `init || input`, so callers that pass options
+            // (method/body/signal/...) do not lose them when the URL changes.
+            input = new Request(newUrl, init || input);
           }
         }
         init = init || {};
-        init.headers = new Headers(init.headers || (input && input.headers) || undefined);
-        // Pass the *real* referer to the server via a side header.
-        if (!init.headers.has('siteproxy-newreferer')) {
-          var real = unRewriteURL(location.href);
-          if (real !== location.href) init.headers.set('siteproxy-newreferer', real);
-        }
+        init.headers = headers;
       } catch (e) { /* fallthrough: fetch directly */ }
       return originalFetch(input, init);
     };
@@ -527,7 +637,16 @@
       this.__siteproxy_real_url = url;
       var args = Array.prototype.slice.call(arguments);
       if (typeof url === 'string' || url instanceof URL) args[1] = proxyRewrite(String(url));
-      return OriginalOpen.apply(this, args);
+      var out = OriginalOpen.apply(this, args);
+      try {
+        this.setRequestHeader('siteproxy-target-protocol', proxy_real_protocol);
+        this.setRequestHeader('siteproxy-target-host', proxy_real_host);
+        this.setRequestHeader('siteproxy-real-referer',
+          getRefererFromLocation(location.href, proxy_real_protocol, proxy_real_host));
+        this.setRequestHeader('siteproxy-window-location-pathname',
+          (window.___location && window.___location.pathname) || '/');
+      } catch (e) { /* headers may be locked */ }
+      return out;
     };
     XMLHttpRequest.prototype.send = function (body) {
       try {
@@ -535,6 +654,10 @@
         if (real !== location.href) {
           this.setRequestHeader('siteproxy-newreferer', real);
         }
+        this.setRequestHeader('siteproxy-real-referer',
+          getRefererFromLocation(location.href, proxy_real_protocol, proxy_real_host));
+        this.setRequestHeader('siteproxy-window-location-pathname',
+          (window.___location && window.___location.pathname) || '/');
       } catch (e) { /* headers may be locked */ }
       return OriginalSend.call(this, body);
     };
@@ -1296,30 +1419,34 @@
   //     original warning text and styling.
   // ------------------------------------------------------------------
   (function () {
-    var KEY = 'siteproxy_topbar_last_shown';
+    var KEY = 'topBarLastShown';
     var INTERVAL = 24 * 60 * 60 * 1000;
     function show() {
       try {
         var last = parseInt(localStorage.getItem(KEY) || '0', 10);
-        if (Date.now() - last < INTERVAL) return;
+        if (last && Date.now() - last < INTERVAL) return;
       } catch (e) { /* private mode */ }
       var bar = document.createElement('div');
       bar.setAttribute('data-siteproxy-topbar', '1');
       bar.style.cssText = 'position:fixed;top:0;left:0;width:100%;z-index:10000;' +
-        'background:#ff0000;color:#ffffff;text-align:center;font:bold 13px sans-serif;' +
-        'padding:10px 40px 10px 12px;box-shadow:0 1px 4px rgba(0,0,0,.4)';
-      bar.innerHTML = '!!! This is a SiteProxy proxied website, do not enter your personal information. ' +
-        'Refer to: <a style="color:#ffffff" href="https://github.com/netptop/siteproxy">' +
-        'https://github.com/netptop/siteproxy</a>' +
-        '<span style="position:absolute;right:12px;top:50%;transform:translateY(-50%);' +
-        'cursor:pointer;font-size:16px;padding:0 6px;">&times;</span>';
-      var closer = bar.querySelector('span');
+        'background:#ff0000;color:#ffffff;text-align:center;font:bold 13px/20px sans-serif;' +
+        'padding:5px 0;box-shadow:0 1px 4px rgba(0,0,0,.4)';
+      var closer = document.createElement('span');
+      closer.innerHTML = '&times;';
+      closer.style.cssText = 'position:absolute;right:10px;top:50%;transform:translateY(-50%);' +
+        'cursor:pointer;font-size:20px;line-height:20px;font-weight:normal';
       closer.addEventListener('click', function () {
-        bar.remove();
+        bar.style.display = 'none';
+        if (document.body) document.body.style.marginTop = '0';
         try { localStorage.setItem(KEY, String(Date.now())); } catch (e) { /* ignore */ }
       });
-      (document.body || document.documentElement).appendChild(bar);
-      try { localStorage.setItem(KEY, String(Date.now())); } catch (e) { /* ignore */ }
+      bar.innerHTML = '!!! This is a SiteProxy proxied website, do not enter your personal information. Refer to: ' +
+        '<a href="https://github.com/netptop/siteproxy" target="_blank" ' +
+        'style="color:#ffffff;text-decoration:underline;">https://github.com/netptop/siteproxy</a> for details !!!';
+      bar.appendChild(closer);
+      if (!document.body) return;
+      document.body.insertBefore(bar, document.body.firstChild);
+      document.body.style.marginTop = bar.offsetHeight + 'px';
     }
     if (document.readyState === 'loading') {
       document.addEventListener('DOMContentLoaded', show);
@@ -1331,6 +1458,10 @@
   // Expose minimal internals for debugging.
   window.siteproxyRegReplacement = function (u) { return proxyRewrite(u); };
   // Upstream compatibility surface used by page scripts and iframe hooks.
+  window.debouncedAttributeChanged = function (node) {
+    try { traverse(node || document); } catch (e) { /* ignore */ }
+  };
+  window.siteproxyAttributeChanged = window.debouncedAttributeChanged;
   window.removeProxyPrefix = unRewriteURL;
   window.delay = function (ms) {
     return new Promise(function (resolve) { setTimeout(resolve, ms); });

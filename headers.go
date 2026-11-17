@@ -40,7 +40,7 @@ var (
 		"Cross-Origin-Opener-Policy", "Cross-Origin-Opener-Policy-Report-Only",
 		"Cross-Origin-Embedder-Policy", "Cross-Origin-Embedder-Policy-Report-Only",
 		"Cross-Origin-Resource-Policy",
-		"X-Frame-Options", "Permissions-Policy", "Report-To",
+		"X-Frame-Options", "Permissions-Policy", "Permissions-Policy-Report-Only", "Report-To",
 		"Reporting-Endpoints", "X-Xss-Protection",
 		"Nel", // Network Error Logging points at the upstream origin
 		"Clear-Site-Data", "Public-Key-Pins",

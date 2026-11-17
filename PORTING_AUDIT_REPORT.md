@@ -641,3 +641,184 @@ go build -o /tmp/diff/siteproxy-go .
 - SW 鉴权：原版无 token 校验并复用旧注册，Go 的 v4 + token 校验更安全。
 
 其余待办仅剩第一轮的 P-05（内置黑名单产品决策）和 P-06 顶栏/根路径/Bing 等低风险兼容项。
+
+---
+
+## 11. 第三轮深度对比（2026-11-17 晚）
+
+本轮只做审查，未修改实现。基线仍为 Node v2.7.11（:5606），Go 为当前构建（:5607），
+临时对比实例使用相同 `proxy_url=http://proxy.test`。
+
+### 11.1 新增发现
+
+以下 9 项已在第三轮修复中处理，具体变更与验证见 §12；本节保留审查时的原始描述。
+
+| 编号 | 严重度 | 类型 | 结论 |
+| --- | --- | --- | --- |
+| P-21 | 高 | 安全/配置 | `token_prefix` 为 `"/"`、`"//"` 或 `""` 时语义与上游完全不同：上游统一改为 `/default/` 并设置 `default_password`，Go 把 `"/"` 当作免密码、把 `""` 当作 `/user22334455/`。已有 Node 配置直接切到 Go 时，`"/"` 会静默变成公开代理 |
+| P-22 | 中 | 响应头泄漏 | Go 未剥离 `Permissions-Policy-Report-Only`；上游 `_0x14b59b` 会剥离，实测 Node 不返回该头，Go 原样返回。Go 的 `stripResponseHeaders` 只包含 `Permissions-Policy`，漏了 `-Report-Only` |
+| P-23 | 中低 | 客户端兼容 | Go 未暴露上游的 `getRefererFromLocation`、`getHostFromProxyPrefixedURL`、`getPathnameFromProxyPrefixedURL`、`getProtocolFromProxyPrefixedURL`、`setProtocolFromProxyPrefixedURL`、`siteproxyAttributeChanged`、`debouncedAttributeChanged`、`siteproxyRegReplacementFallback`、`removeProxyPrefixFallback`；fetch/XHR 也未发送上游的 `siteproxy-target-protocol/host`、`siteproxy-real-referer`、`siteproxy-window-location-pathname` |
+| P-24 | 中低 | 客户端逻辑 | `fetch(new Request(url), init)` 在 URL 需要重写时，Go 用 `new Request(newUrl, input)` 丢掉了调用方传入的 `init`（method/body/signal 等）；上游使用 `new Request(rewritten, init || input)` |
+| P-25 | 低 | 客户端 UI | 顶栏 key 为 `siteproxy_topbar_last_shown`（上游 `topBarLastShown`）；Go 在显示时立即写 key，上游只在点击关闭时写；Go 未给 body 加 `marginTop`，固定顶栏会覆盖页面内容；文案也缺少 `target="_blank"` 与 `for details !!!` |
+| P-26 | 低 | 客户端逻辑 | `isNotURL` 未拒绝字符串 `"undefined"`、`"null"`、`"[object Object]"`；上游会拒绝，Go 会把这些字符串当作相对 URL 导航 |
+| P-27 | 低 | 客户端逻辑 | Go 只改写 `history` 实例属性；上游改写 `History.prototype.pushState/replaceState`。页面缓存 `const p = history.pushState` 或通过原型调用时，Go 不会拦截 |
+| P-28 | 低 | 响应清理 | 304 与“非文本体重定向”响应，Go 保留 `Content-Length`/`Content-Encoding`；上游对 204/304/301/302/303/307/308 统一删除这三个头 |
+| P-29 | 低 | 文档 | README 仍称 `token_prefix=""` 回退 `/user22334455/`、`"/"` 免密码；称 Connection 命名头“与原版一致地转发”；称 JS 会重写“引号包裹的绝对 URL 字面量”。这三条与上游实测或当前实现不符 |
+
+### 11.2 关键证据
+
+**P-21 令牌语义**
+
+上游 `_0x500ad5`（`/tmp/deob/deobfuscated.js:2047`）对 `"/"`、`"//"`、`""` 统一执行：
+
+```js
+token_prefix = "/default/";
+default_password = true;
+```
+
+临时 Node 实例（`token_prefix="/"` 与 `""`，端口 5610/5611）访问 `/`、`/default/` 均返回
+`302 Location: http://proxy.test/default/https/www.netptop.com`；访问 `/default/http/127.0.0.1:5701/echo` 返回 200。
+
+Go（`token_prefix="/"`，端口 5612）访问 `/` 返回 200 首页，访问 `/http/127.0.0.1:5701/echo` 返回 200；
+Go（`token_prefix=""`，端口 5613）实际 token 变成 `/user22334455/`，`/default/` 返回 404。
+对应实现为 `config.go` 的 `normalizeTokenPrefix` 与 `noPassword`。
+
+**P-22 响应头泄漏**
+
+临时目标返回 `Permissions-Policy-Report-Only: geolocation=()`：
+
+```text
+Node : 无该响应头
+Go   : Permissions-Policy-Report-Only: geolocation=()
+```
+
+上游剥离集合见 `/tmp/deob/deobfuscated.js` 的 `_0x14b59b`；Go 集合见 `headers.go` 的
+`stripResponseHeaders`。
+
+**P-23 客户端兼容面**
+
+`curl -sS http://127.0.0.1:5607/siteproxy-response-injected.js` 中以下字符串出现次数均为 0：
+
+```text
+getRefererFromLocation
+getHostFromProxyPrefixedURL
+getPathnameFromProxyPrefixedURL
+getProtocolFromProxyPrefixedURL
+setProtocolFromProxyPrefixedURL
+siteproxyAttributeChanged
+debouncedAttributeChanged
+siteproxyRegReplacementFallback
+removeProxyPrefixFallback
+```
+
+上游对应定义见 `/tmp/deob/injected/deobfuscated.js`；fetch/XHR 的 target 头见同文件
+`window.fetch` 与 `XMLHttpRequest.prototype.open` 两段。
+
+**P-24 fetch 初始化参数**
+
+Go 当前逻辑（`assets/injected.tmpl.js` 的 `window.fetch`）：
+
+```js
+if (newUrl !== input.url) input = new Request(newUrl, input);
+```
+
+需要改成与上游一致：
+
+```js
+input = new Request(newUrl, init || input);
+```
+
+否则 `fetch(request, { method, body, signal })` 在 URL 被重写时会丢掉 `init`。
+
+**P-25 顶栏**
+
+上游使用 `localStorage.getItem("topBarLastShown")`，只在关闭按钮中写入时间，并执行
+`document.body.style.marginTop = bar.offsetHeight + "px"`；Go 使用 `siteproxy_topbar_last_shown`，
+在 `show()` 末尾立即写入，且没有设置 body 边距。
+
+**P-28 304/重定向头清理**
+
+上游 `_0x43f3ca` 对 204 和 301/302/303/304/307/308 执行：
+
+```js
+body = undefined;
+headers.delete("content-length");
+headers.delete("content-encoding");
+headers.delete("transfer-encoding");
+```
+
+Go 的 `proxy.go` 只在重定向分支删除 `Content-Length`，304 分支不删除任何表示头，
+非文本体的重定向也保留 `Content-Encoding`。
+
+### 11.3 结论与优先级
+
+P-21 是本轮唯一的“高危安全/配置”问题，优先级高于其余项：它会让沿用的 Node 配置在切换后
+从密码保护变成公开代理。建议先做以下决策再改代码：
+
+1. 是否保留 Go 的免密码模式；若保留，改为独立的显式配置（如 `disable_auth`），不再复用 `token_prefix="/"`。
+2. 是否实现上游的 `default_password` 首页跳转；至少应把 `"/"`、`"//"`、`""` 映射到 `/default/`，避免配置语义漂移。
+3. P-22 只需把 `Permissions-Policy-Report-Only` 加入剥离列表并加一条回归测试。
+4. P-23/P-24/P-25/P-26/P-27 属于客户端兼容/浏览器行为，建议在 P-21/P-22 之后统一补齐。
+5. P-28 按“严格移植”或“保留更宽容的 Go 行为”做产品决策，并同步 README；P-29 直接修正文档。
+
+本节记录的是第三轮审查当时的状态。对应修复、测试和文档更新见 §12。
+
+
+---
+
+## 12. 第三轮修复记录（2026-11-17 晚）
+
+第三轮发现已全部落地，未改变第一轮/第二轮已关闭的设计决策。质量门禁：
+
+```bash
+cd /workspace
+gofmt -w audit5_test.go config.go headers.go main.go proxy.go server.go
+node --check assets/injected.tmpl.js
+node --check assets/service-worker.tmpl.js
+go test ./...
+go vet ./...
+go build -o /tmp/diff/siteproxy-go .
+```
+
+结果：测试通过，vet 无输出，构建成功。
+
+### 12.1 P-21 默认密码与免密模式
+
+- `config.go`：`""`、`"/"`、`"//"` 统一归一化为 `/default/`，并设置 `DefaultPassword`；新增显式 `disable_auth` 配置与 `SITEPROXY_DISABLE_AUTH` 环境变量。`noPassword()` 只认显式 `disable_auth`，不再把 `token_prefix="/"` 当免密。
+- `server.go`：`DefaultPassword` 模式下 `/`、`/{token}/` 与非法路径 302 到 `{proxy_url}/default/https/www.netptop.com`，合法的 `/default/http/{host}/...` 仍正常代理。
+- 实测（Go 5612，`token_prefix="/"`）：`/` 与 `/default/` 均 302 到 `http://proxy.test/default/https/www.netptop.com`；`/default/http/127.0.0.1:5701/echo` 返回 200。与 Node 5610 对齐。
+- 旧配置从 Node 切到 Go 不再把 `"/"` 静默变成公开代理；需要免密必须显式 `disable_auth: true`。
+
+### 12.2 P-22 响应头
+
+- `headers.go` 的 `stripResponseHeaders` 增加 `Permissions-Policy-Report-Only`。
+- 新增 `TestPermissionsPolicyReportOnlyStripped`。
+
+### 12.3 P-23/P-24/P-25/P-26/P-27 客户端运行时
+
+`assets/injected.tmpl.js`：
+
+- 新增 `removeProxyPrefixFallback`、`getRefererFromLocation`、`getHostFromProxyPrefixedURL`、`getPathnameFromProxyPrefixedURL`、`getProtocolFromProxyPrefixedURL`、`setProtocolFromProxyPrefixedURL`、`siteproxyRegReplacementFallback`、`siteproxyAttributeChanged`、`debouncedAttributeChanged`。
+- fetch/XHR 增加上游的 `siteproxy-target-protocol`、`siteproxy-target-host`、`siteproxy-real-referer`、`siteproxy-window-location-pathname` 请求头。
+- `fetch(Request, init)` 改为 `new Request(newUrl, init || input)`，不再丢 `init`。
+- `isNotURL` 拒绝字符串 `"undefined"`、`"null"`、`"[object Object]"`。
+- 改为 patch `History.prototype.pushState/replaceState`，保留 `History.prototype.___pushState/___replaceState` 原生方法；实例 `history.___pushState` 继续服务 inline bootstrap。
+- 顶栏 key 改为 `topBarLastShown`，只在关闭时写 localStorage，插入 body 后设置 `marginTop`，文案补 `target="_blank"` 与 `for details !!!`。
+
+新增 `TestInjectedCompatibilitySurface` 检查公共运行时包含这些兼容符号且不 bake token。
+
+### 12.4 P-28 204/304 与重定向表示头
+
+- `proxy.go` 新增 `stripNoBodyHeaders`：204/304 与响应体重写后的重定向删除 `Content-Length`、`Content-Encoding`、`Transfer-Encoding`。
+- net/http 对无体重定向可能自行生成 `Content-Length: 0`，测试允许该框架生成值，但不允许上游原始长度/编码存活。
+- 新增 `TestNoBodyAndRedirectHeadersAreStripped`。
+
+### 12.5 P-29 文档
+
+- README 修正 `token_prefix` 默认语义、`default_password` 跳转、`disable_auth`、304/重定向表示头、Connection 命名头、JS 字面量重写、`/{token}/` 根路径和兼容符号列表。
+- 新增 `audit5_test.go`，覆盖 P-21、P-22、P-28 和客户端兼容面。
+
+### 12.6 剩余边界
+
+- `Connection` 命名的普通请求头仍按 Go 当前实现转发；原版 Node fetch 的运行时拒绝边界没有完全模拟，已在 README 明确披露。
+- P-15/P-16/P-17（额外 charset meta）/P-18 等第一轮已确认的设计差异保持不变。

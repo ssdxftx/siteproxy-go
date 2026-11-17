@@ -18,7 +18,7 @@ user browser +--------------->+ siteproxy-go   +-------> wikipedia
 | 功能 | 原版 (Node.js) | siteproxy-go |
 |------|---------------|--------------|
 | 路径式反代 `{token}{proto}/{host}/{path}` | ✅ | ✅ 同样的 URL 格式 |
-| token_prefix 密码保护 | ✅ | ✅ |
+| token_prefix 密码保护 | ✅ | ✅ 含上游 `default_password` 语义与显式 `disable_auth` 扩展 |
 | HTML/CSS/JS 服务端 URL 重写（href/src/srcset/action/url()/@import） | ✅ | ✅ 含 v2.7.x 各项修复（srcset 逗号、style 内 url()、自引用防双包等） |
 | 客户端运行时（location / history / window.open / fetch / XHR / sendBeacon 覆盖） | ✅ 混淆 | ✅ 明文重写；另额外覆盖 WebSocket / EventSource |
 | Service Worker（越界请求修复、404 延迟返回、PROXY_CUR_LOCATION 同步） | ✅ 混淆 | ✅ 明文重写 |
@@ -61,6 +61,7 @@ linux/amd64、linux/arm64、darwin/amd64、darwin/arm64、windows/amd64、freebs
 {
   "proxy_url": "https://your-proxy.domain.name",
   "token_prefix": "/user-SetYourPasswordHere/",
+  "disable_auth": false,
   "local_listen_port": 5006,
   "blocked_sites": [],
   "description": "注意:token_prefix相当于网站密码，请谨慎设置,首尾的斜杠必须保留。 proxy_url和token_prefix合起来就是访问网址。"
@@ -70,7 +71,8 @@ linux/amd64、linux/arm64、darwin/amd64、darwin/arm64、windows/amd64、freebs
 | 字段 | 说明 |
 |------|------|
 | `proxy_url` | 对外访问的完整地址（nginx 反代之后的公网 URL），用于生成代理链接、判断 HTTPS |
-| `token_prefix` | 访问密码，**首尾斜杠必须保留**；空字符串回退到上游默认 token `/user22334455/`，显式设为 `"/"` 表示免密码（Go 扩展，启动时会打印警告） |
+| `token_prefix` | 访问密码，**首尾斜杠必须保留**；`""`、`"/"`、`"//"` 与上游一致归一化为共享密码 `/default/` 并启用 `default_password`（首页和非法路径 302 到 netptop 入口）。需要真正免密码时使用独立字段 `disable_auth: true`，不要在旧配置里继续用 `"/"` 代表免密码 |
+| `disable_auth` | 显式关闭 token 鉴权（Go 扩展，默认 `false`）；关闭后 URL 形状为 `/{proto}/{host}/...`，启动时会打印警告 |
 | `local_listen_port` | 监听端口（默认 5006，与原版/nginx 配置兼容） |
 | `blocked_sites` | 禁止代理的站点列表；仅按此处显式配置生效，不内置任何域名 |
 | `cookie_max_age_seconds` | 非控制 Cookie 的生命周期上限，默认 `1800`；短于上限的 `Max-Age` / `Expires` 原样保留，超长才截断；设为 `0` 完全保留上游过期策略 |
@@ -84,6 +86,8 @@ export SITEPROXY_TOKEN_PREFIX=/user-your-password/
 export SITEPROXY_LOCAL_LISTEN_PORT=5006
 export SITEPROXY_BLOCKED_SITES=a.com,b.com
 export SITEPROXY_COOKIE_MAX_AGE=1800
+# 仅在确实需要公开代理时使用；默认关闭
+export SITEPROXY_DISABLE_AUTH=0
 
 # 仅调试自签名上游证书时设为 1，生产环境保持 0
 export SITEPROXY_INSECURE_SKIP_VERIFY=0
@@ -104,7 +108,8 @@ export SITEPROXY_USE_ENV_PROXY=1
 http://127.0.0.1:5006/user22334455/https/example.com/
 ```
 
-> 启用 `token_prefix` 时，公开根路径 `/` 返回 404（避免把带 token 的首页泄露给未认证访问者）；首页入口是 `http://127.0.0.1:5006/user22334455/`。
+> 启用普通 `token_prefix` 时，公开根路径 `/` 返回 404（避免把带 token 的首页泄露给未认证访问者）；首页入口是 `http://127.0.0.1:5006/user22334455/`。
+> 当 `token_prefix` 为 `""`、`"/"` 或 `"//"` 时，Go 与上游一样把 token 归一化为 `/default/` 并启用 `default_password`：`/`、`/default/` 和非法路径 302 到 `/default/https/www.netptop.com`。
 
 按 `Ctrl+C` 停止。本地 HTTP 仅用于测试，公网部署请使用下面的 nginx + TLS。
 
@@ -341,16 +346,16 @@ Service Worker 会自动带上该前缀。
 
 一次请求经过的完整流水线：
 
-1. **路由**：`/{token_prefix}https/{host}/{path}` → 鉴权 → 解析目标；错误 token、未知路径和非法目标返回 404；`/{token_prefix}/` 是启用密码时的首页入口（公开 `/` 不再返回含 token 的首页）。
+1. **路由**：`/{token_prefix}https/{host}/{path}` → 鉴权 → 解析目标；错误 token、未知路径和非法目标返回 404；`/{token_prefix}/` 是普通密码模式的首页入口（公开 `/` 不再返回含 token 的首页）。`default_password` 模式（`""`/`"/"`/`"//"`）则把首页和非法路径 302 到 `/default/https/www.netptop.com`。
 2. **请求侧**：剥离 hop-by-hop 与 CDN 注入头（`cf-*`、`x-forwarded-*` 等）；`Referer`/`Origin`
    从代理形式还原为真实目标；`Cookie` 因 Path 隔离天然只含当前站点；透传 POST/PUT 请求体。
 3. **WebSocket**：`Upgrade: websocket` 请求走 hijack 双向管道，完整支持 Telegram Web 等长连接。
-4. **上游抓取**：不跟随重定向（302 交给浏览器在代理内继续）；`Accept-Encoding: gzip, deflate, br`。
+4. **上游抓取**：不跟随重定向（302 交给浏览器在代理内继续）；Go 发送 `Accept-Encoding: gzip, deflate, br` 并自行解码，原版 Node 仅发送 `gzip`。
 5. **响应侧**：剥离 CSP / COOP / COEP / HSTS 等会作用于代理域的安全头；仅对
    301/302/303/307/308 重写 `Location`（300/304/305/306/309 原样保留），并重写
    `Refresh` / `Set-Cookie`（Cookie 按站点隔离到 `Path={token}{proto}/{host}`）；SSE 与二进制逐块透传。
 6. **文本重写**：HTML（属性 / srcset / style / meta refresh / `<base>`）注入运行时脚本；CSS（url() / @import）；
-   JS（引号包裹的绝对 URL 字面量，正则字面量不受影响）。
+   JS 只重写 `location` 等标识符与运行时导航调用，字符串/正则字面量保持原样，避免破坏脚本。
 7. **字符集**：GBK/Big5/Shift-JIS 等自动转码为 UTF-8 并注入 `<meta charset>`。
 8. **浏览器端**：注入脚本以源码形式提供 `proxyRewrite()`（与原版规则一致），覆盖
    location / pushState / fetch / XHR / WebSocket / EventSource / sendBeacon / document.URL，
@@ -387,7 +392,7 @@ make test
 ```
 
 覆盖：URL 转换、HTML/CSS/JS 重写、CSP 剥离、Cookie 隔离、重定向、gzip/brotli 解码、
-GBK 转码、二进制透传、SSE 流式、请求头变换、黑名单、token 鉴权、免密码模式、WebSocket 回显。
+GBK 转码、二进制透传、SSE 流式、请求头变换、黑名单、token 鉴权、显式 `disable_auth`、WebSocket 回显。
 
 ## FAQ
 
@@ -406,7 +411,7 @@ Go 版面向 VPS 部署（与原版 Node VPS 部署方式一致）。原版为�
 - **压缩响应**：Go 自行解码 gzip/deflate/br 后重写；可运行的 worker bundle 对照中，上游未解码并直接回传压缩字节，Go 的文本重写更完整。
   遇到双方都无法解码的编码（如 zstd）时，原版直接 500 崩溃，Go 版原样透传（保留 Content-Encoding，不重写）。
 - **空 Content-Type**：Go 不补响应头、不重写正文；浏览器按内容嗅探（HTML 会正常渲染）。原版 Node 会由 `Response` 按字符串正文补出 `text/plain; charset=UTF-8`。
-- **3xx 正文**：仅 301/302/303/307/308 丢弃正文并重写 `Location`；300/305/306/309 保留正文与原始 `Location`。原版对 204 和 304 也会清空正文，Go 对 304 保留表示头并转发（通常无正文）。
+- **3xx 正文**：仅 301/302/303/307/308 丢弃正文并重写 `Location`；300/305/306/309 保留正文与原始 `Location`。204/304 与重定向响应统一删除上游的 `Content-Length`、`Content-Encoding`、`Transfer-Encoding`，不转发原表示体。
 - **206 Partial Content**：Go 原样流式透传字节段并保留 `Content-Range`；上游会把字节段当完整文档重写，导致 `Content-Length` 与 `Content-Range` 冲突。
 - **损坏的 gzip**：Go 回放解码器已消费的头部字节后原样透传；上游直接 500。
 - **Referer / Origin**：带 `Siteproxy-Newreferer` 时 Origin 取该 URL 的 origin；否则从代理 Referer 还原 Referer，
@@ -423,16 +428,19 @@ Go 版面向 VPS 部署（与原版 Node VPS 部署方式一致）。原版为�
 - **控制 cookie**：两版一致——仅在被重写的文本响应（html/js/css，status<500）上追加
   `proxy_real_protocol/host; Path=/; HttpOnly`，并在上游转发前过滤。
 - **X-Forwarded-For**：原版不向上游发送，Go 版同样不发送。
-- **Connection 命名头**：与原版一致地转发（RFC 语义上属于 hop-by-hop，但保持严格对齐）。
+- **Connection 命名头**：Go 当前会转发普通头（只过滤固定 hop-by-hop 集合）；原版 Node fetch 对部分 Connection 命名头会在运行时拒绝。该边界尚未完全对齐，README 不再声称“严格一致”。
 - **srcset 解析**：与原版 v2.7.10 算法逐字节一致（URL token 扫描到空白为止、仅尾部逗号作分隔符），
   压缩 HTML（`1x,b.png 2x` 无空格形式）与含逗号 URL 均正确处理。
 - **WebSocket**：原版 node VPS 模式不支持 WebSocket；Go 版原生支持，且升级请求同样过滤控制 cookie
   并接管 hijack 缓冲字节（提前到达的帧不丢失）。
 - **首页 / SW**：原版 node 模式不内置首页，但会动态返回 `/siteproxy_service_worker.js` 并由客户端注册；Go 版同时提供首页与 SW，行为取 CF 模式超集。
-- **`/{token}/` 根路径**：原版 302 跳转到硬编码的 `www.netptop.com`；Go 版直接显示首页（自部署更合理）。
+- **`/{token}/` 根路径**：普通密码模式下 Go 显示本地首页；`default_password` 模式（token 由 `""`/`"/"`/`"//"` 归一化而来）与上游一致 302 到 `/default/https/www.netptop.com`。
 - **YouTube 播放页重定向**：原版把 `youtube.com/watch` 重定向到 netptop.com 的嵌入播放器（公共站专用）；
   Go 版不做该跳转，保持站内代理播放。
 - **404 处理**：原版 SW 把 404 延迟 3 秒返回（不重发）；Go 版已对齐为延迟后原样返回。
+- **默认密码（已对齐）**：`token_prefix` 为 `""`、`"/"`、`"//"` 时两版都归一化为 `/default/` 并启用 `default_password`；首页和非法路径 302 到 `www.netptop.com` 的代理入口。Go 的免密码模式改为显式 `disable_auth: true`，避免旧 Node 配置切换后静默变成公开代理。
+- **响应头清理**：`Permissions-Policy-Report-Only` 与 `Permissions-Policy` 一样剥离；204/304 和重定向不再保留上游的 `Content-Length`/`Content-Encoding`/`Transfer-Encoding`。
+- **客户端兼容面**：补齐 `getRefererFromLocation`、`getHostFromProxyPrefixedURL`、`getPathnameFromProxyPrefixedURL`、`getProtocolFromProxyPrefixedURL`、`setProtocolFromProxyPrefixedURL`、`siteproxyAttributeChanged`、`debouncedAttributeChanged`、`siteproxyRegReplacementFallback`、`removeProxyPrefixFallback`，并在 fetch/XHR 发送 `siteproxy-target-*` 等上游头；`fetch(Request, init)` 保留 `init`，历史 API 改为 patch `History.prototype`。
 - **Service Worker 鉴权**：Go 的注册 URL 额外携带 `token_prefix` 且版本为 `v=4`，服务端校验 token 后才返回
   Worker；原版为 `v=3`、只要求 `proxy_real_host`，任何匿名请求都能读取含 token 的 Worker。升级时 Go 会通过
   `registrationMatches` 重新注册并自愈。
@@ -450,7 +458,7 @@ Go 版面向 VPS 部署（与原版 Node VPS 部署方式一致）。原版为�
   裸字符串 `@import "x.css"` 和大写 `URL(...)` 都保留原样；Go 版统一改写为代理绝对 URL，
   避免 `<base>` 干扰，语义更完整。
 - **`x-siteproxy-body-headers`**：原版与 Go 版都会剥离所有 `siteproxy*` 前缀的请求头，不转发给上游。
-- **响应头剥离超集**：Go 版额外剥离 COOP/COEP/CORP/Permissions-Policy/Alt-Svc 等安全头
+- **响应头剥离超集**：Go 版额外剥离 COOP/COEP/CORP/Permissions-Policy(-Report-Only)/Alt-Svc 等安全头
   （原版仅剥离 CSP 与 x-frame-options 及 siteproxy*/cf-*/x-forwarded* 家族——Go 已对齐该家族的前缀过滤）。
 - **加固项（Go 版增强）**：handler panic 恢复中间件（单请求 502，不拖垮进程）；out-of-scope 修复路径
   对控制 cookie 中的主机做严格校验（防 cookie 投毒 / userinfo 走私）；客户端运行时增加

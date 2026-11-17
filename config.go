@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 )
 
@@ -18,9 +19,23 @@ type Config struct {
 	ProxyURL string `json:"proxy_url"`
 
 	// TokenPrefix is the "password" embedded in every proxied URL, it must
-	// start and end with "/". An empty value uses the upstream default token
-	// "/user22334455/"; an explicit "/" disables authentication (Go extension).
+	// start and end with "/". The upstream server treats "", "/" and "//" as
+	// the shared default password "/default/" (and redirects invalid paths to
+	// its public homepage); those values are normalised the same way here.
 	TokenPrefix string `json:"token_prefix"`
+
+	// DefaultPassword is set when TokenPrefix was one of "", "/" or "//".
+	// Like upstream `default_password`, it makes the homepage and invalid
+	// paths redirect to the public netptop entry instead of showing a local
+	// token-scoped index. It is derived from TokenPrefix, not read from JSON.
+	DefaultPassword bool `json:"-"`
+
+	// DisableAuth explicitly disables token authentication (Go extension).
+	// It is deliberately separate from token_prefix so that switching an
+	// upstream config whose token_prefix is "/" cannot silently turn the
+	// proxy into an open relay. Use token_prefix="/" plus this flag when you
+	// really want every path to be proxied without a password.
+	DisableAuth bool `json:"disable_auth"`
 
 	// LocalListenPort is the HTTP port this server listens on.
 	LocalListenPort int `json:"local_listen_port"`
@@ -43,6 +58,7 @@ type Config struct {
 //	SITEPROXY_TOKEN_PREFIX       -> TokenPrefix
 //	SITEPROXY_LOCAL_LISTEN_PORT  -> LocalListenPort
 //	SITEPROXY_BLOCKED_SITES      -> BlockedSites (comma separated)
+//	SITEPROXY_DISABLE_AUTH       -> DisableAuth (1/true)
 func LoadConfig(path string) (*Config, error) {
 	cfg := &Config{
 		ProxyURL:        "http://localhost:5006",
@@ -78,6 +94,11 @@ func LoadConfig(path string) (*Config, error) {
 			cfg.CookieMaxAge = age
 		}
 	}
+	if v := os.Getenv("SITEPROXY_DISABLE_AUTH"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			cfg.DisableAuth = b
+		}
+	}
 	if v := os.Getenv("SITEPROXY_BLOCKED_SITES"); v != "" {
 		cfg.BlockedSites = nil
 		for _, s := range strings.Split(v, ",") {
@@ -101,7 +122,15 @@ func (c *Config) normalize() (*Config, error) {
 		return nil, fmt.Errorf("invalid proxy_url %q (need an absolute http(s) URL without query/fragment)", c.ProxyURL)
 	}
 
-	c.TokenPrefix = normalizeTokenPrefix(c.TokenPrefix)
+	if c.DisableAuth {
+		// The URL shape stays "/{proto}/{host}/..." in no-password mode.
+		c.TokenPrefix = "/"
+		c.DefaultPassword = false
+	} else {
+		rawToken := strings.TrimSpace(c.TokenPrefix)
+		c.TokenPrefix = normalizeTokenPrefix(rawToken)
+		c.DefaultPassword = rawToken == "" || rawToken == "/" || rawToken == "//"
+	}
 	if strings.ContainsAny(c.TokenPrefix, " \t\r\n?#") {
 		return nil, fmt.Errorf("invalid token_prefix %q (whitespace, ? and # are not allowed)", c.TokenPrefix)
 	}
@@ -130,15 +159,12 @@ func (c *Config) normalize() (*Config, error) {
 }
 
 // normalizeTokenPrefix ensures the prefix starts and ends with "/".
-// An empty value falls back to the upstream default token "/user22334455/";
-// only an explicit "/" disables authentication.
+// Upstream `_0x500ad5` maps "", "/" and "//" to the shared "/default/"
+// password and sets default_password; the latter is handled by normalize.
 func normalizeTokenPrefix(p string) string {
 	p = strings.TrimSpace(p)
-	if p == "" {
-		return defaultTokenPrefix
-	}
-	if p == "/" {
-		return "/"
+	if p == "" || p == "/" || p == "//" {
+		return "/default/"
 	}
 	if !strings.HasPrefix(p, "/") {
 		p = "/" + p
@@ -206,7 +232,7 @@ func (c *Config) BasePath() string {
 	return strings.TrimRight(u.Path, "/")
 }
 
-// noPassword reports whether token authentication is disabled.
+// noPassword reports whether token authentication is explicitly disabled.
 func (c *Config) noPassword() bool {
-	return c.TokenPrefix == "/"
+	return c.DisableAuth
 }

@@ -378,6 +378,14 @@ func (p *Proxy) writeResponse(w http.ResponseWriter, r *http.Request, resp *http
 	// without its encoding.
 	rewriteResponseHeaders(p.cfg, resp, outHeader, target, needsProcess && !isHead)
 
+	// 204/304 carry no representation body. Upstream `_0x43f3ca` deletes
+	// Content-Length, Content-Encoding and Transfer-Encoding for both; a
+	// stale Content-Encoding on 304 otherwise makes browsers keep a cached
+	// compressed variant for a body they will never receive.
+	if resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusNotModified {
+		stripNoBodyHeaders(outHeader)
+	}
+
 	if isHead {
 		w.WriteHeader(resp.StatusCode)
 		return
@@ -391,7 +399,7 @@ func (p *Proxy) writeResponse(w http.ResponseWriter, r *http.Request, resp *http
 		if needsProcess {
 			p.addControlCookies(outHeader, target)
 		}
-		outHeader.Del("Content-Length")
+		stripNoBodyHeaders(outHeader)
 		w.WriteHeader(resp.StatusCode)
 		return
 	}
@@ -508,6 +516,15 @@ func (p *Proxy) writeResponse(w http.ResponseWriter, r *http.Request, resp *http
 	outHeader.Set("Content-Length", fmt.Sprint(len(out)))
 	w.WriteHeader(resp.StatusCode)
 	_, _ = w.Write(out)
+}
+
+// stripNoBodyHeaders removes representation headers for responses whose body
+// is not forwarded (204/304 and rewritten redirects), matching upstream
+// `_0x43f3ca`.
+func stripNoBodyHeaders(h http.Header) {
+	h.Del("Content-Length")
+	h.Del("Content-Encoding")
+	h.Del("Transfer-Encoding")
 }
 
 // addControlCookies adds the HttpOnly site-context cookies to responses whose
