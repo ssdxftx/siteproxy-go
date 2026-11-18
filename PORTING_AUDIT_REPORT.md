@@ -1295,3 +1295,258 @@ go build -o /tmp/diff/siteproxy-go .
 
 §15.3 中 `serveStaticJS` 响应头、404 错误页文案和 `validPort("+80")` 仍属于低风险
 差异，未在本轮改动。
+
+---
+
+## 17. 第六轮深度对比审查（2026-11-17 傍晚）
+
+本轮基线为 Node v2.7.11（:5606）与当前 Go 构建（:5607，commit `18d93c9`）。
+新增两个临时上游验证边角：
+
+- `:5705`：同时下发 `Max-Age` 与 `Expires` 的 `Set-Cookie`（`/both`）；
+- `:5706`：Telegram 目标下返回 GBK 编码 CSS（`/tgcss2`）。
+
+上游证据仍为 `/tmp/deob/deobfuscated.js`、`/tmp/deob/injected/deobfuscated.js`
+和 `/tmp/deob/sw/deobfuscated.js`。本轮只审查，不修改实现。
+
+### 17.1 新增发现
+
+| 编号 | 级别 | 类型 | 结论 |
+| --- | --- | --- | --- |
+| P-41 | 中 | Cookie 生命周期 | `Set-Cookie` 同时带 `Max-Age` 与 `Expires` 时，Go 会输出两个 `Max-Age`（一个来自原属性、一个来自 `Expires` 截断），上游只输出一个；浏览器可能按最后一个值解释，导致上限/删除语义不稳定 |
+| P-42 | 中低 | Telegram CSS 字符集 | Telegram 的 GBK CSS 被 Go 转成 UTF-8，但响应中的 `@charset "gbk"` 未改写；浏览器会按旧 `@charset` 重新解码 UTF-8 字节，中文内容变成乱码。上游保留原始 GBK 字节和 GBK 响应头 |
+| P-43 | 低 | 客户端 URL 还原 | 目标根路径 `/{token}/{proto}/{host}/` 经客户端 `unRewriteURL` 后丢失尾斜杠，`___location.href` / `document.URL` 为 `http://host`，上游为 `http://host/` |
+| P-44 | 低 | Service Worker | Go 对 POST/PUT/PATCH 的 404 也延迟 3 秒；上游只在非 POST 分支的后台请求返回 404 时延迟，POST 分支直接返回 |
+| P-45 | 低 | 客户端兼容面 | `window.traverseAndModifyNode(node)` / `window.debouncedAttributeChanged(node)` 只遍历 `node` 的后代，不处理 `node` 自身的属性；上游 `_0x3ab317` 会先处理根节点 |
+
+### 17.2 证据与复现
+
+**P-41 同时带 Max-Age 与 Expires 的 Set-Cookie**
+
+上游 mock 返回：
+
+```text
+Set-Cookie: both1=v; Path=/; Max-Age=60; Expires=Wed, 21 Oct 2030 07:28:00 GMT
+Set-Cookie: both2=v; Path=/; Expires=Wed, 21 Oct 2030 07:28:00 GMT; Max-Age=60
+```
+
+实测：
+
+```text
+Node :5606:
+  both1=v; Path=/...; Domain=proxy.test; Max-Age=1800
+  both2=v; Path=/...; Domain=proxy.test; Max-Age=1800
+
+Go :5607:
+  both1=v; Path=/...; Max-Age=60; Max-Age=1800
+  both2=v; Path=/...; Max-Age=1800; Max-Age=60
+```
+
+原因在 `当前工作区/headers.go:341-380`：`Max-Age` 属性保留/截断后设置
+`hasLifetime=true`，但 `Expires` 分支仍会独立追加一个 `Max-Age=1800`。
+`hasLifetime` 只阻止最后的兜底追加，不会阻止这两个分支各自追加。
+重复属性不符合 RFC 6265；当 `Max-Age` 与 `Expires` 顺序不同时，浏览器选择
+前一个或后一个会得到不同生命周期。极端情况下 `Max-Age` 非删除值 +
+过去时间 `Expires` 还可能把本应删除的 Cookie 延长到 30 分钟。
+
+**P-42 Telegram CSS 的旧 @charset 与 UTF-8 响应头冲突**
+
+mock 返回 `Content-Type: text/css; charset=gbk`，正文为：
+
+```css
+@charset "gbk";
+a{content:"中"}
+```
+
+其中“中”是 GBK 字节 `d6 d0`。实测：
+
+| 响应 | Node :5606 | Go :5607 |
+| --- | --- | --- |
+| Content-Type | `text/css; charset=gbk` | `text/css; charset=UTF-8` |
+| `@charset` | `"gbk"` | `"gbk"`（未改写） |
+| “中”字节 | `d6 d0`（GBK） | `e4 b8 ad`（UTF-8） |
+
+`当前工作区/proxy.go:676-680` 对 Telegram CSS 先调用 `decodeTextBody`，然后直接
+`return txt`。注释写的是“返回原始 CSS”，实际返回的是已转码的 UTF-8 文本；
+而非 Telegram 分支在 `当前工作区/proxy.go:685-687` 会调用 `rewriteCSSCharset`。
+浏览器按 `@charset "gbk"` 解码 UTF-8 字节，中文因此显示为乱码。上游
+`_0x4b0bf2` 的 Telegram 分支不进入 CSS 处理，保留原始字节与 GBK 响应头。
+
+修复方向：Telegram CSS 应返回 `raw`（解码压缩后的原始字符集字节），或至少在
+返回 `txt` 前调用 `rewriteCSSCharset` 并把响应头同步为 UTF-8；不能只改其中一边。
+
+**P-43 客户端还原目标根路径丢失尾斜杠**
+
+`当前工作区/assets/injected.tmpl.js:262-265`：
+
+```js
+var m = path.match(/^(https?)\/([^/]+)(?:\/(.*))?$/);
+if (!m) return url;
+var real = m[1] + '://' + m[2];
+if (m[3]) real += '/' + m[3];
+return real;
+```
+
+当路径为 `https/host/` 时，`m[3]` 是空字符串，`if (m[3])` 为假，结果变成
+`https://host`。上游 `_0x33e758.unrewrite` 在去掉 token 后调用 `new URL()`，
+`new URL("https://host").href` 会补成 `https://host/`。用 Node 直接执行当前
+客户端脚本验证：
+
+```text
+root:  http://target.test
+path:  http://target.test/a/b
+query: http://target.test/?x=1
+```
+
+`___location.href`、`document.URL`、`document.documentURI` 和 `toString()`
+都经过这个函数；依赖尾斜杠字符串比较的页面脚本会观察到差异。服务器端
+`UnrewriteURLWithBase` 会把根路径补成 `/`，客户端与此不一致。
+
+**P-44 Service Worker 的 404 延迟覆盖 POST**
+
+上游 `/tmp/deob/sw/deobfuscated.js:300-318` 只在非 POST/PUT/PATCH 分支的
+`fetch` 返回 404 时延迟 3 秒；POST 分支直接 `return fetch(...).then(...)`。
+`当前工作区/assets/service-worker.tmpl.js:240-252` 在统一拿到 `resp` 后
+对所有方法执行 404 延迟，因此 POST/PUT/PATCH 的 404 也会多等 3 秒。功能上
+仍返回原响应，属于延迟差异。
+
+**P-45 兼容遍历不处理根节点**
+
+上游 `_0x3ab317` 在遍历一个节点时会先处理该节点自身的 URL 属性，再递归子节点。
+当前客户端 `traverse(root)` 使用 `root.querySelectorAll('*')`，只覆盖后代；
+`window.traverseAndModifyNode(node)` 和 `window.debouncedAttributeChanged(node)`
+直接调用 `traverse`，因此传入的根元素自身的 `href/src/style` 等不会改写。
+常规的 `rewriteElement` + `traverse` 插入路径会先单独处理根节点，所以影响主要
+出现在页面脚本主动调用这两个兼容 API 时。
+
+### 17.3 其他观察
+
+- 上游的 HTML/JS 标识符重写会连注释里的 `location` 也改成 `___location`；
+  Go 的 `rewriteJSIdentifiers` 保留注释和可见文本，只在真实 JS 语境中改写。
+  这是 Go 更精确的行为，但属于未写入 README 的差异。
+- 上游 CSS 的 `@charset` 大小写与 `@import url( '...' )` 空格会原样保留；
+  Go 会规范化为 `@charset "UTF-8"` 并压缩 `url(...)` 内空白。属于字节级差异，
+  不影响语义；普通 CSS 的 `@charset` 改写是有意的 UTF-8 修复。
+- `validPort("+80")`、`serveStaticJS` 响应头和 404 错误页文案仍是 §15.3
+  记录的低风险项，本轮未新增改动。
+
+### 17.4 建议优先级
+
+1. **P-42**：Telegram CSS 乱码是真实可见缺陷，优先修 `renderCSS` 的 Telegram
+   分支，保证 `@charset`、响应头和字节编码三者一致。
+2. **P-41**：避免重复 `Max-Age`；在任一有效生命周期属性处理后不再追加第二个上限，
+   并补 `Max-Age` + `Expires` 组合测试。
+3. **P-43**：客户端根路径补尾斜杠，补一个在 Node 中执行运行时脚本的回归测试，
+   断言 `unRewriteURL(".../https/host/") === "https://host/"`。
+4. **P-44**：把 404 延迟移回非 POST 分支，或明确记录这一延迟差异。
+5. **P-45**：让兼容遍历先处理根节点，或改为与上游一致的递归遍历。
+
+### 17.5 质量门禁
+
+本轮未修改实现代码；现有测试和构建基线继续通过：
+
+```bash
+cd /workspace
+go test ./...
+go vet ./...
+go build -o /tmp/diff/siteproxy-go .
+```
+
+结果：测试通过，vet 无输出，构建成功。以上 P-41 至 P-45 留待下一轮修复。
+
+---
+
+## 18. 第六轮修复记录（2026-11-18）
+
+P-41 至 P-45 已修复。本轮未改变此前已披露的 P-05/P-07/P-15/P-16/P-17/P-18
+等有意差异。
+
+### 18.1 P-41 Set-Cookie 生命周期属性只输出一次
+
+- `rewriteSetCookie` 在写入属性前先扫描全部属性：只要存在任意 `Max-Age`，
+  就由 `Max-Age` 决定生命周期并丢弃 `Expires`，避免 `Expires` 截断逻辑再追加
+  第二个 `Max-Age`。
+- 任意过去的 `Expires` 视为删除标记，优先于正的 `Max-Age`：删除 `Max-Age`、
+  保留过去的 `Expires`，避免把待删除 Cookie 复活。
+- `TestSetCookieMultipleLifetimeAttrsHasSingleMaxAge` 覆盖四种组合：
+  `Max-Age` 在前/在后、长 `Max-Age`+远 `Expires`、过去 `Expires`+长 `Max-Age`。
+
+实测新构建（`/tmp/diff/siteproxy-go`，临时 `:5619`）：
+
+```text
+both1=v; Path=...; Max-Age=60
+both2=v; Path=...; Max-Age=60
+```
+
+### 18.2 P-42 Telegram CSS 保留原始字符集字节
+
+- `renderCSS` 把 Telegram 判断移到 `decodeTextBody` 之前；Telegram CSS 直接返回
+  解压后的原始字节，不再转 UTF-8，也不再进入 `@charset` / `url()` 重写。
+- 响应头由 `writeResponse` 按原始字节判断：GBK 字节不是合法 UTF-8，因此保留
+  上游的 `text/css; charset=gbk`，`@charset "gbk"` 与正文编码一致。
+- `TestTelegramLegacyCSSKeepsOriginalBytesAndHeader` 同时验证
+  `renderCSS` 字节不变，以及 `writeResponse` 的响应头和正文不变。
+
+实测 GBK 响应：
+
+```text
+Content-Type: text/css; charset=gbk
+正文中的“中”：d6 d0（GBK）
+```
+
+### 18.3 P-43 客户端目标根路径补尾斜杠
+
+- `unRewriteURL` 改为分别捕获 host、rest 和 hash；当 rest 为空或以 `?` 开头时先补
+  `/`，再拼接 rest/hash。例如：
+  - `https/host` -> `https://host/`
+  - `https/host/` -> `https://host/`
+  - `https/host?x=1` -> `https://host/?x=1`
+  - `https/host#f` -> `https://host/#f`
+- 用 Node 直接执行当前 `assets/injected.tmpl.js` 验证：
+
+```text
+root:  http://target.test/
+path:  http://target.test/a/b
+query: http://target.test/?x=1
+```
+
+- `TestClientUnrewriteRootAndTraverseRoot` 加入源码级回归守卫。
+
+### 18.4 P-44 Service Worker 只对非写请求延迟 404
+
+- 计算 `isWriteMethod`（POST/PUT/PATCH），404 延迟条件改为
+  `resp.status === 404 && !isWriteMethod`。
+- POST/PUT/PATCH 的 404 立即返回，与上游非写分支的 3 秒延迟保持一致。
+- `TestServiceWorker404DelayExcludesWriteMethods` 检查两个关键分支。
+
+### 18.5 P-45 兼容遍历处理根节点
+
+- `traverse(root)` 先对 `root` 自身调用 `rewriteElement`，再遍历
+  `root.querySelectorAll('*')`；`window.traverseAndModifyNode(node)` 和
+  `window.debouncedAttributeChanged(node)` 因此也会处理传入元素自身的
+  `href/src/style/srcset` 等属性。
+- `TestClientUnrewriteRootAndTraverseRoot` 加入根节点处理守卫。
+
+### 18.6 本轮修改文件
+
+- `headers.go`、`proxy.go`
+- `assets/injected.tmpl.js`、`assets/service-worker.tmpl.js`
+- `audit8_test.go`（新增）
+- `README.md`
+- `PORTING_AUDIT_REPORT.md`
+
+### 18.7 质量门禁
+
+```bash
+cd /workspace
+gofmt -w headers.go proxy.go audit8_test.go
+node --check assets/injected.tmpl.js
+node --check assets/service-worker.tmpl.js
+go test ./...
+go vet ./...
+go build -o /tmp/diff/siteproxy-go .
+```
+
+结果：`gofmt` 已执行，两个 `node --check` 通过，`go test ./...` 通过，
+`go vet ./...` 无输出，构建成功。临时实例 `:5619` 的 Cookie 与 Telegram GBK
+CSS 实测结果见 §18.1 和 §18.2。

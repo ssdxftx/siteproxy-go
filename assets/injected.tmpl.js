@@ -259,10 +259,15 @@
       } catch (e) { /* not a URL */ }
       return url;
     }
-    var m = path.match(/^(https?)\/([^/]+)(?:\/(.*))?$/);
+    var m = path.match(/^(https?)\/([^/?#]+)([^#]*)(#.*)?$/);
     if (!m) return url;
     var real = m[1] + '://' + m[2];
-    if (m[3]) real += '/' + m[3];
+    var rest = m[3] || '';
+    var hash = m[4] || '';
+    // A real URL root always has a trailing slash (upstream unrewrite uses
+    // new URL(), whose href normalises "https://host" to "https://host/").
+    if (!rest || rest.charAt(0) === '?') real += '/';
+    real += rest + hash;
     return real;
   }
 
@@ -1307,6 +1312,9 @@
 
   function traverse(root) {
     try {
+      // Include the supplied element itself; upstream `_0x3ab317` rewrites
+      // the root node's attributes before walking its descendants.
+      if (root && root.nodeType === 1) rewriteElement(root);
       var all = (root || document).querySelectorAll('*');
       for (var i = 0; i < all.length; i++) rewriteElement(all[i]);
     } catch (e) { /* ignore */ }

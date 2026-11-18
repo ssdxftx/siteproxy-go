@@ -224,7 +224,8 @@ async function handleFetch(event) {
 
   // Text-ish request bodies: un-rewrite embedded proxied URLs / identifiers.
   const method = req.method.toUpperCase();
-  if (method === 'POST' || method === 'PUT' || method === 'PATCH') {
+  const isWriteMethod = method === 'POST' || method === 'PUT' || method === 'PATCH';
+  if (isWriteMethod) {
     const clone = req.clone();
     const ct = clone.headers.get('Content-Type') || '';
     const enc = clone.headers.get('Content-Encoding');
@@ -246,8 +247,10 @@ async function handleFetch(event) {
       headers: { 'Content-Type': 'text/plain; charset=UTF-8' },
     });
   }
-  if (resp && resp.status === 404) {
-    // Upstream behaviour: delay the 404 by 3s, then return it unchanged.
+  if (resp && resp.status === 404 && !isWriteMethod) {
+    // Upstream behaviour: only background-style (non write) requests delay
+    // the 404 by 3s, then return it unchanged. POST/PUT/PATCH 404s return
+    // immediately.
     await new Promise((r) => setTimeout(r, 3000));
   }
   return resp;

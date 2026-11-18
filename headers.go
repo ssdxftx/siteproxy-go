@@ -319,6 +319,34 @@ func rewriteSetCookie(sc, token, sitePrefix string, cfg *Config) string {
 	// in the output, so the cap must not be appended on top of it.
 	hasLifetime := false
 
+	// Detect lifetime attributes before emitting any of them. Browsers give
+	// Max-Age precedence over Expires, so when both are present we must emit
+	// only one effective lifetime; otherwise a long Max-Age plus a far
+	// Expires produces two Max-Age attributes after capping. A past Expires
+	// is a deletion and wins over a positive Max-Age.
+	hasMaxAgeAttr := false
+	hasPastExpiresAttr := false
+	now := time.Now()
+	for _, p := range parts[1:] {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		name, val := p, ""
+		if i := strings.IndexByte(p, '='); i >= 0 {
+			name = strings.TrimSpace(p[:i])
+			val = strings.TrimSpace(p[i+1:])
+		}
+		switch strings.ToLower(name) {
+		case "max-age":
+			hasMaxAgeAttr = true
+		case "expires":
+			if t, err := http.ParseTime(val); err == nil && t.Before(now) {
+				hasPastExpiresAttr = true
+			}
+		}
+	}
+
 	// Extract attributes, dropping/rewriting the isolation-relevant ones.
 	// Attribute names are parsed with optional whitespace around '=' (e.g.
 	// "Path = /", "Domain = .example.com"): browsers accept that form, so a
@@ -339,6 +367,11 @@ func rewriteSetCookie(sc, token, sitePrefix string, cfg *Config) string {
 		case "domain":
 			// drop: cookies become host-only on the proxy domain
 		case "max-age":
+			if !isControl && hasPastExpiresAttr {
+				// A past Expires is a deletion; do not let a positive
+				// Max-Age resurrect the cookie.
+				continue
+			}
 			n, err := strconv.Atoi(val)
 			if err != nil {
 				// Preserve malformed values; the browser treats them as a
@@ -361,9 +394,14 @@ func rewriteSetCookie(sc, token, sitePrefix string, cfg *Config) string {
 			}
 			hasLifetime = true
 		case "expires":
+			if !isControl && hasMaxAgeAttr && !hasPastExpiresAttr {
+				// Max-Age is authoritative when both attributes are
+				// present. Dropping Expires avoids emitting a second
+				// Max-Age (the cap) and leaves one unambiguous lifetime.
+				continue
+			}
 			if capLifetime {
 				if t, err := http.ParseTime(val); err == nil {
-					now := time.Now()
 					if t.Before(now) {
 						hasPastExpires = true
 						attrs = append(attrs, p)

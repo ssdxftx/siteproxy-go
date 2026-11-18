@@ -673,12 +673,15 @@ func (p *Proxy) renderCSS(resp *http.Response, body io.Reader, target *TargetInf
 	if len(raw) == 0 {
 		return raw, false, nil
 	}
-	txt, used := decodeTextBody(raw, resp.Header.Get("Content-Type"))
-	// Telegram CSS follows the upstream dedicated branch: no @charset or URL
-	// rewriting at all.
+	// Telegram CSS follows the upstream dedicated branch: no charset
+	// transcoding, @charset rewrite or URL rewriting. Return the original
+	// bytes so the response headers and the in-document @charset stay in the
+	// same encoding; returning decoded UTF-8 text here would leave
+	// `@charset "gbk"` pointing at the old encoding.
 	if skipURLRewriteForHost(target.Host) {
-		return txt, false, nil
+		return raw, false, nil
 	}
+	txt, used := decodeTextBody(raw, resp.Header.Get("Content-Type"))
 	// Normalise @charset whenever the bytes really are UTF-8, even if the
 	// HTTP header (not the @charset) was what told us so. Leaving a stale
 	// "@charset gbk" in a UTF-8 stylesheet makes the browser re-decode it.

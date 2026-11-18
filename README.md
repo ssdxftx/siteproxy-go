@@ -423,7 +423,9 @@ Go 版面向 VPS 部署（与原版 Node VPS 部署方式一致）。原版为�
 - **cookie 生命周期**：Go 把非控制 Set-Cookie 的生命周期限制在 30 分钟内——原本更短的
   `Max-Age` / `Expires` 原样保留，超过上限时才截断；上游则删除所有 `Max-Age`，并只给
   没有 `Expires` 的 Cookie 追加 `Max-Age=1800`，会丢失站点自己的短生命周期设置。
-  可用 `cookie_max_age_seconds: 0` 完全保留上游原始过期策略。`Domain` 仍一律剥离成 host-only。
+  同时出现 `Max-Age` 和 `Expires` 时以 `Max-Age` 为准，只输出一个生命周期属性；过去的
+  `Expires` 作为删除标记优先于正的 `Max-Age`。可用 `cookie_max_age_seconds: 0` 完全保留
+  上游原始过期策略。`Domain` 仍一律剥离成 host-only。
 - **Secure / SameSite 归一**：HTTPS 部署下原样保留 `Secure` 与 `SameSite=None/Strict`；纯 HTTP 部署下去掉 `Secure`，并仅把浏览器会拒收的 `SameSite=None` 改为 `Lax`。
 - **控制 cookie**：两版一致——仅在被重写或超限原样转发的文本响应（html/js/css，status<500）上追加
   `proxy_real_protocol/host; Path=/; HttpOnly`，并在上游转发前过滤；超过 16 MiB 的页面仍会带上站点上下文，
@@ -438,10 +440,10 @@ Go 版面向 VPS 部署（与原版 Node VPS 部署方式一致）。原版为�
 - **`/{token}/` 根路径**：普通密码模式下 Go 显示本地首页；`default_password` 模式（token 由 `""`/`"/"`/`"//"` 归一化而来）与上游一致 302 到 `/default/https/www.netptop.com`。
 - **YouTube 播放页重定向**：原版把 `youtube.com/watch` 重定向到 netptop.com 的嵌入播放器（公共站专用）；
   Go 版不做该跳转，保持站内代理播放。
-- **404 处理**：原版 SW 把 404 延迟 3 秒返回（不重发）；Go 版已对齐为延迟后原样返回。
+- **404 处理**：原版 SW 对非 POST/PUT/PATCH 请求把 404 延迟 3 秒返回（不重发）；Go 版已对齐，写请求的 404 立即返回。
 - **默认密码（已对齐）**：`token_prefix` 为 `""`、`"/"`、`"//"` 时两版都归一化为 `/default/` 并启用 `default_password`；首页和非法路径 302 到 `www.netptop.com` 的代理入口。Go 的免密码模式改为显式 `disable_auth: true`，避免旧 Node 配置切换后静默变成公开代理。
 - **响应头清理**：`Permissions-Policy-Report-Only` 与 `Permissions-Policy` 一样剥离；204/304 和重定向不再保留上游的 `Content-Length`/`Content-Encoding`/`Transfer-Encoding`。
-- **客户端兼容面**：补齐 `getRefererFromLocation`、`getHostFromProxyPrefixedURL`、`getPathnameFromProxyPrefixedURL`、`getProtocolFromProxyPrefixedURL`、`setProtocolFromProxyPrefixedURL`、`siteproxyAttributeChanged`、`debouncedAttributeChanged`、`siteproxyRegReplacementFallback`、`removeProxyPrefixFallback`，并在 fetch/XHR 发送 `siteproxy-target-*` 等上游头；`fetch(Request, init)` 保留 `init`，历史 API 改为 patch `History.prototype`。
+- **客户端兼容面**：补齐 `getRefererFromLocation`、`getHostFromProxyPrefixedURL`、`getPathnameFromProxyPrefixedURL`、`getProtocolFromProxyPrefixedURL`、`setProtocolFromProxyPrefixedURL`、`siteproxyAttributeChanged`、`debouncedAttributeChanged`、`siteproxyRegReplacementFallback`、`removeProxyPrefixFallback`，并在 fetch/XHR 发送 `siteproxy-target-*` 等上游头；`fetch(Request, init)` 保留 `init`，历史 API 改为 patch `History.prototype`；`unRewriteURL` 对目标根路径补尾斜杠，兼容遍历先处理传入节点自身。
 - **Service Worker 鉴权**：Go 的注册 URL 额外携带 `token_prefix` 且版本为 `v=4`，服务端同时校验 token 和
   合法的 `proxy_real_host` 后才返回 Worker；缺少或非法 host 与上游一样返回 404，且不会从 Referer 回填目标。
   原版为 `v=3`、只要求 `proxy_real_host`，任何匿名请求都能读取含 token 的 Worker。升级时 Go 会通过
@@ -469,7 +471,8 @@ Go 版面向 VPS 部署（与原版 Node VPS 部署方式一致）。原版为�
   `cookieInterceptionRan` 兼容面；拒绝 `requestStorageAccessFor` / `serviceWorker` 时使用上游一致的
   `NotAllowedError`。
 - **Telegram 特殊分支**：目标 host 含 `telegram.org` 时与上游 `_0x4b0bf2` 的 Telegram 分支一致，
-  跳过 URL、内联脚本标识符、integrity/crossorigin 和 meta CSP 处理，只保留字符集处理与运行时注入。
+  跳过 URL、内联脚本标识符、integrity/crossorigin 和 meta CSP 处理。HTML/JS 仍做字符集转换与
+  运行时注入；CSS 保留原始字符集字节和响应头，不改 `@charset`，避免声明与实际编码冲突。
 - **Google 内联 integrity 清理**：目标 host 含 `google.com` 时删除内联脚本中的 `;x.integrity='sha...';`
   赋值，避免重写后的脚本 SRI 校验失败（与原版 `_0x1afa37` 一致）。
 - **IDN 目标主机**：Unicode 或百分号编码的主机会规范化为 punycode 后再构造上游 URL，
